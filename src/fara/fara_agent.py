@@ -57,6 +57,8 @@ class FaraAgent:
         max_rounds: int = 10,
         save_screenshots: bool = False,
         logger: logging.Logger | None = None,
+        use_local_model: bool = False,
+        local_model_id: str = "microsoft/Fara-7B",
     ):
         self.downloads_folder = downloads_folder
         if not os.path.exists(self.downloads_folder or "") and self.downloads_folder:
@@ -83,6 +85,8 @@ class FaraAgent:
         self.viewport_height = 900
         self.viewport_width = 1440
         self.include_input_text_key_args = True
+        self.use_local_model = use_local_model
+        self.local_model_id = local_model_id
 
         def _download_handler(download: Download) -> None:
             self._last_download = download
@@ -92,6 +96,9 @@ class FaraAgent:
 
         # OpenAI client will be initialized in initialize()
         self._openai_client: AsyncOpenAI | None = None
+        # Local model/processor will be initialized in initialize() if use_local_model=True
+        self._local_model = None
+        self._local_processor = None
         self._chat_history: List[LLMMessage] = []
 
     async def initialize(self) -> None:
@@ -100,11 +107,14 @@ class FaraAgent:
         self._last_download = None
         self._prior_metadata_hash = None
 
-        # Initialize OpenAI client
-        self._openai_client = AsyncOpenAI(
-            api_key=self.client_config.get("api_key"),
-            base_url=self.client_config.get("base_url"),
-        )
+        if self.use_local_model:
+            self._init_local_model()
+        else:
+            # Initialize OpenAI client
+            self._openai_client = AsyncOpenAI(
+                api_key=self.client_config.get("api_key"),
+                base_url=self.client_config.get("base_url"),
+            )
 
         # Set up download handler
         self.browser_manager.set_download_handler(self._download_handler)
@@ -112,6 +122,106 @@ class FaraAgent:
         # Initialize browser
         await self.browser_manager.init(self.start_page)
         self.did_initialize = True
+
+    def _init_local_model(self):
+        """Load the model and processor locally for direct inference."""
+        import torch
+        from fara.modeling.modeling_qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
+        from fara.modeling.image_processing_qwen2_vl import Qwen2VLImageProcessor
+        from transformers import Qwen2_5_VLProcessor
+
+        self.logger.info(f"Loading local model: {self.local_model_id}")
+        self._local_processor = Qwen2_5_VLProcessor.from_pretrained(self.local_model_id)
+        self._local_processor.image_processor = Qwen2VLImageProcessor.from_pretrained(
+            self.local_model_id
+        )
+        self._local_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            self.local_model_id,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+        )
+        self._local_model.eval()
+        self.logger.info("Local model loaded successfully.")
+
+    def _history_to_qwen_messages(self, history: List[LLMMessage]) -> list:
+        """Convert FARA's LLMMessage history to Qwen chat format.
+
+        Qwen expects a list of dicts with 'role' and 'content', where content
+        is either a string or a list of dicts with type 'text' or 'image'.
+        """
+        messages = []
+        for msg in history:
+            if isinstance(msg, SystemMessage):
+                role = "system"
+            elif isinstance(msg, AssistantMessage):
+                role = "assistant"
+            else:
+                role = "user"
+
+            if isinstance(msg.content, list):
+                content = []
+                for item in msg.content:
+                    if isinstance(item, ImageObj):
+                        content.append({"type": "image", "image": item.image})
+                    elif isinstance(item, str):
+                        content.append({"type": "text", "text": item})
+                    elif isinstance(item, dict) and item.get("type") == "text":
+                        content.append({"type": "text", "text": item["text"]})
+                messages.append({"role": role, "content": content})
+            else:
+                messages.append({"role": role, "content": msg.content})
+        return messages
+
+    async def _make_local_model_call(
+        self,
+        history: List[LLMMessage],
+        extra_create_args: Dict[str, Any] | None = None,
+    ) -> ModelResponse:
+        """Run inference locally using the loaded model and processor."""
+        import torch
+
+        messages = self._history_to_qwen_messages(history)
+
+        # Collect PIL images in order for the processor
+        images = []
+        for msg in messages:
+            if isinstance(msg["content"], list):
+                for item in msg["content"]:
+                    if item.get("type") == "image":
+                        images.append(item["image"])
+                        # Replace PIL image with Qwen's image placeholder for text template
+                        item["image"] = item.pop("image")
+
+        text = self._local_processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True,
+        )
+        inputs = self._local_processor(
+            text=[text],
+            images=images if images else None,
+            padding=True,
+            return_tensors="pt",
+        ).to(self._local_model.device)
+
+        with torch.no_grad():
+            generated_ids = self._local_model.generate(
+                **inputs,
+                max_new_tokens=2048,
+                do_sample=False,
+            )
+
+        # Trim input tokens from output
+        input_len = inputs["input_ids"].shape[1]
+        output_ids = generated_ids[:, input_len:]
+        content = self._local_processor.batch_decode(
+            output_ids, skip_special_tokens=True,
+        )[0]
+
+        usage = {
+            "prompt_tokens": input_len,
+            "completion_tokens": output_ids.shape[1],
+            "total_tokens": input_len + output_ids.shape[1],
+        }
+        return ModelResponse(content=content, usage=usage)
 
     @property
     def _page(self) -> Page | None:
@@ -164,7 +274,10 @@ class FaraAgent:
         history: List[LLMMessage],
         extra_create_args: Dict[str, Any] | None = None,
     ) -> ModelResponse:
-        """Make a model call using OpenAI client"""
+        """Make a model call using either local model or OpenAI-compatible API."""
+        if self.use_local_model:
+            return await self._make_local_model_call(history, extra_create_args)
+
         openai_messages = [message_to_openai_format(msg) for msg in history]
         request_params = {
             "model": self.client_config.get("model", "gpt-4o"),

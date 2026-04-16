@@ -10,9 +10,39 @@ from eval_exp import EvalExp, ModelReference, get_foundry_endpoint_configs
 from webeval.oai_clients.graceful_client import GracefulRetryClient
 from webeval.eval_result import EvalResult, Stage
 from arg_parsing import get_eval_args
+import tempfile
+import json
 
 
 DEFAULT_DATA_URL = '../data/webvoyager/WebVoyager_data_08312025.jsonl'
+
+
+def _load_browserbase_env_from_keys_json() -> None:
+    """Populate Browserbase env vars from keys.json if they are missing."""
+    if os.environ.get("BROWSERBASE_API_KEY") and os.environ.get("BROWSERBASE_PROJECT_ID"):
+        return
+
+    candidate_paths = [
+        Path(__file__).resolve().parents[3] / "keys.json",  # evoskill-march11/keys.json
+        Path(__file__).resolve().parent / "keys.json",
+    ]
+
+    for keys_path in candidate_paths:
+        if not keys_path.exists():
+            continue
+        try:
+            with open(keys_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            continue
+
+        api_key = data.get("browser_base_api_key")
+        project_id = data.get("browser_base_project_id")
+        if api_key and not os.environ.get("BROWSERBASE_API_KEY"):
+            os.environ["BROWSERBASE_API_KEY"] = api_key
+        if project_id and not os.environ.get("BROWSERBASE_PROJECT_ID"):
+            os.environ["BROWSERBASE_PROJECT_ID"] = project_id
+        break
 
 class Callback:
     def __init__(self):
@@ -26,10 +56,20 @@ class Callback:
 
 def add_webvoyager_args(parser):
     parser.add_argument('--eval_data_url', type=str, default = DEFAULT_DATA_URL, help='Azure URI to the evaluation data (None for vanilla webvoyager)')
+    parser.add_argument('--local', action='store_true', help='Run model locally instead of calling a vLLM API endpoint')
+    parser.add_argument('--local_model_id', type=str, default='microsoft/Fara-7B', help='HuggingFace model ID for local inference')
 
 
 def main():
     args = get_eval_args(add_webvoyager_args)
+
+    # Use an ephemeral local tracking DB unless the user provides a tracking URI.
+    # This avoids failures caused by stale schemas in persistent sqlite files.
+    if not os.environ.get("MLFLOW_TRACKING_URI"):
+        tmp_tracking_dir = tempfile.mkdtemp(prefix="webvoyager-mlflow-")
+        mlflow.set_tracking_uri(f"sqlite:///{tmp_tracking_dir}/mlflow.db")
+
+    _load_browserbase_env_from_keys_json()
 
     if args.browserbase:
         assert os.environ.get("BROWSERBASE_API_KEY"), "BROWSERBASE_API_KEY environment variable must be set to use browserbase"
@@ -83,6 +123,8 @@ def main():
             gpt_solver_model_name=args.gpt_solver_model_name,
             fn_call_template=args.fn_call_template,
             step_budgets=args.step_budgets,
+            use_local_model=args.local,
+            local_model_id=args.local_model_id,
         )
 
 
@@ -91,13 +133,18 @@ def main():
         # set data_dir to absolute path of this file, then go to ../data/webvoyager
         data_dir = Path(__file__).resolve().parent.parent / "data" / "webvoyager"
         data_dir.mkdir(parents=True, exist_ok=True)
-        eval_client = GracefulRetryClient.from_path(args.eval_oai_config, logger=logger, eval_model=args.eval_model)
+        if args.skip_eval:
+            eval_client = None
+        else:
+            eval_client = GracefulRetryClient.from_path(args.eval_oai_config, logger=logger, eval_model=args.eval_model)
         benchmark = WebVoyagerBenchmark(
             data_dir=data_dir,
-            eval_method="gpt_eval",
+            eval_method="gpt_eval" if not args.skip_eval else "exact_match",
             model_client=eval_client,
             data_az_folder = args.eval_data_url,
         )
+        if isinstance(args.eval_data_url, str) and args.eval_data_url.lower().endswith('.jsonl'):
+            benchmark.data_file = str(Path(args.eval_data_url).expanduser().resolve())
 
         mlflow.log_param('subsample', args.subsample)
         mlflow.log_param('processes', args.processes)
@@ -114,7 +161,8 @@ def main():
             processes = args.processes,
             callbacks = [Callback()],
             eval_only = args.eval_only,
-            max_error_task_retries = args.max_error_task_retries)
+            max_error_task_retries = args.max_error_task_retries,
+            skip_eval = args.skip_eval)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,5 @@
+{
+    "api_key": "none",
+    "model": "fara-hf-local",
+    "base_url": "http://127.0.0.1:5000/v1"
+}

@@ -70,7 +70,9 @@ class WebSurferSystem(BaseSystem):
         gpt_solver_model_name: Optional[str] = None, # used for gpt_solver to specify the model name
         fn_call_template: str = "default",
         step_budgets: List[int] = None,
-        save_env_state: bool = False
+        save_env_state: bool = False,
+        use_local_model: bool = False,
+        local_model_id: str = "microsoft/Fara-7B",
     ) -> None:
         super().__init__(system_name)
         self.web_surfer_model_type = web_surfer_model_type
@@ -83,6 +85,8 @@ class WebSurferSystem(BaseSystem):
         self.gpt_solver_model_name = gpt_solver_model_name
         self.fn_call_template = fn_call_template
         self.step_budgets = step_budgets or []
+        self.use_local_model = use_local_model
+        self.local_model_id = local_model_id
 
         ### add a bool to save env_state
         self.save_env_state=save_env_state
@@ -194,7 +198,9 @@ class WebSurferSystem(BaseSystem):
                     downloads_folder=output_dir,
                     save_screenshots=True,
                     max_rounds=100,
-                    logger = logger
+                    logger=logger,
+                    use_local_model=self.use_local_model,
+                    local_model_id=self.local_model_id,
                 )
 
                 await agent.initialize()
