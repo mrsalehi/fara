@@ -171,7 +171,7 @@ class EvalExp:
         """Clean MLflow keys by replacing unsupported characters, Names may only contain alphanumerics, underscores (_), dashes (-), periods (.), spaces ( ), colon(:) and slashes (/)."""
         return ''.join(c if c.isalnum() or c in ['_', '-', '.', ' ', ':', '/'] else '_' for c in key)[:250]
 
-    def run(self, model_ref, system, benchmark, out_url, subsample = 1.0, redo_eval = False, run_id = '0', split = None, processes = -1, callbacks = None,  eval_only = False, max_error_task_retries = 0):
+    def run(self, model_ref, system, benchmark, out_url, subsample = 1.0, redo_eval = False, run_id = '0', split = None, processes = -1, callbacks = None,  eval_only = False, max_error_task_retries = 0, skip_eval = False):
         # out_az = AzFolder.from_uri(out_url)
         out_context = Path(out_url).expanduser()
         model_ref.log_2_mlflow()
@@ -213,7 +213,7 @@ class EvalExp:
             (output_folder / benchmark.eval_hash()).mkdir(parents=True, exist_ok=True)
             (output_folder / 'traj').mkdir(parents=True, exist_ok=True)
             callback = Callback(callbacks = callbacks or [])
-            results = run_eval_multiple_examples_with_progress(examples, processes, output_folder, redo_eval, system, benchmark, callback, eval_only,  max_error_task_retries)
+            results = run_eval_multiple_examples_with_progress(examples, processes, output_folder, redo_eval, system, benchmark, callback, eval_only,  max_error_task_retries, skip_eval=skip_eval)
             callback.mlflow.flush(force=True)
             metrics = reduce_eval_results(results, benchmark)
             with open(output_folder / benchmark.eval_hash() / 'metrics.json', 'w', encoding='utf-8') as f:

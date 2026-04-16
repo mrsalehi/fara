@@ -73,6 +73,10 @@ class WebVoyagerBenchmark(Benchmark):
             raise ValueError("model_client must be provided for gpt_eval")
         self.model_client = model_client
         self.data_file = os.path.join(self.data_dir, "WebVoyager_data_08312025.jsonl")
+        # Allow callers to pass a specific JSONL data file path via data_az_folder.
+        # If a directory-like value is provided, keep the default file name behavior.
+        if isinstance(data_az_folder, str) and data_az_folder.strip().lower().endswith(".jsonl"):
+            self.data_file = os.path.expanduser(data_az_folder)
         self.reference_file = os.path.join(self.data_dir, "reference_answer.json")
         self.examples = []
         self.data_az_url = data_az_folder
