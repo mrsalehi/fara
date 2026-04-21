@@ -256,6 +256,7 @@ class Qwen2VLImageProcessor(BaseImageProcessor):
         # the base image after the loop.
         patches_multi_scale = []
         positions_multi_scale = []
+        centers_multi_scale = []
         for image in images:
             if do_resize:
                 resized_height, resized_width = smart_resize(
@@ -308,14 +309,39 @@ class Qwen2VLImageProcessor(BaseImageProcessor):
                     patches_this_scale = np.stack([
                         resized_image_this_scale[
                             y//resize_scale:y//resize_scale + merge_patch_size,
-                            x//resize_scale:x//resize_scale + merge_patch_size]
+                            x//resize_scale:x//resize_scale + merge_patch_size
+                            ]
                         for x, y in coords
                     ])
 
                     patches_this_scale = patches_this_scale.reshape(N, merge_size, patch_size, merge_size, patch_size, 3).transpose(0, 1, 3, 2, 4, 5).reshape(N*4, patch_size, patch_size, 3)
                     if data_format == ChannelDimension.FIRST:
                         patches_this_scale = patches_this_scale.transpose(0, 3, 1, 2)
-                    positions_this_scale = np.array([[y // (patch_size * merge_size), x // (patch_size * merge_size)] for x, y in coords])
+
+                    # span = s // merge_patch_size
+                    # positions_this_scale = np.array([[y // merge_patch_size + (span-1)/2, x // merge_patch_size + (span-1)/2] for x, y in coords])
+                    half = s // 2
+                    sub_offsets = [
+                        (0,    0   ),   # TL  (dy, dx)
+                        (0,    half),   # TR
+                        (half, 0   ),   # BL
+                        (half, half),   # BR
+                    ]
+
+                    positions_this_scale = np.array([
+                        [(y + dy) // self.patch_size, (x + dx) // self.patch_size]
+                        for x, y in coords
+                        for dy, dx in sub_offsets
+                    ], dtype=np.int64)
+                
+                    
+                    # window attention book keeping
+                    centers_this_scale = np.array([
+                        [x+s/2, y+s/2] for y, x in coords
+                    ], dtype=np.int64)
+                    centers_multi_scale.append(centers_this_scale)
+
+
                     positions_multi_scale.append(positions_this_scale)
                     patches_multi_scale.append(patches_this_scale)
 
@@ -338,10 +364,14 @@ class Qwen2VLImageProcessor(BaseImageProcessor):
         if traj_per_frame is None:
             patches = np.array(processed_images)
         else:
-            patches = np.concatenate(patches_multi_scale, axis=0)[None, ...]
+            patches = np.concatenate(patches_multi_scale, axis=0)[None, ...]  # shape: (1, num_patches, patch_size, patch_size, 3)
+            positions_multi_scale = np.concatenate(positions_multi_scale, axis=0)
 
         if data_format == ChannelDimension.LAST:
-            patches = patches.transpose(0, 3, 1, 2)
+            if patches.ndim == 4:
+                patches = patches.transpose(0, 3, 1, 2)
+            elif patches.ndim == 5:
+                patches = patches.transpose(0, 1, 4, 2, 3)
 
         if patches.shape[0] % temporal_patch_size != 0:
             repeats = np.repeat(
@@ -369,9 +399,16 @@ class Qwen2VLImageProcessor(BaseImageProcessor):
                 grid_t * grid_h * grid_w, channel * temporal_patch_size * patch_size * patch_size
             )
         else:
-            raise NotImplementedError("Trajectory patch multi-scale path is not implemented yet. will work on it tomorrow")
+            num_patches = patches.shape[1]
+            grid_t = patches.shape[0] // temporal_patch_size
+            # lying about the grid shape as it doesn't matter for the multi-scale
+            # the only thing that matters is that grid_t*grid_h*grid_w == num_patches after flattening
+            grid_h = 2
+            grid_w = num_patches // 2
+            flatten_patches = patches.transpose(1, 2, 0, 3, 4).reshape(-1, temporal_patch_size*patch_size*patch_size*3)
+            return flatten_patches, (grid_t, grid_h, grid_w), positions_multi_scale
 
-        return flatten_patches, (grid_t, grid_h, grid_w)
+        return flatten_patches, (grid_t, grid_h, grid_w), None
 
     def _compute_trajectory_patches(
         self,
@@ -632,7 +669,7 @@ class Qwen2VLImageProcessor(BaseImageProcessor):
             pixel_values, vision_grid_thws = [], []
             for image in images:
                 per_frame = traj_data['per_frame'] if traj_data is not None else None
-                patches, image_grid_thw = self._preprocess(
+                patches, image_grid_thw, maybe_positions_multiscale = self._preprocess(
                     image,
                     do_resize=do_resize,
                     size=size,
@@ -654,7 +691,11 @@ class Qwen2VLImageProcessor(BaseImageProcessor):
                 vision_grid_thws.append(image_grid_thw)
             pixel_values = np.array(pixel_values)
             vision_grid_thws = np.array(vision_grid_thws)
-            data.update({"pixel_values": pixel_values, "image_grid_thw": vision_grid_thws})
+            data.update({
+                "pixel_values": pixel_values, 
+                "image_grid_thw": vision_grid_thws,
+                "maybe_positions_multiscale": maybe_positions_multiscale,
+            })
 
         # kept for BC only and should be removed after v5.0
         if videos is not None:

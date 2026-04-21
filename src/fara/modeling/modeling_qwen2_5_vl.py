@@ -352,33 +352,39 @@ class Qwen2_5_VisionTransformerPretrainedModel(Qwen2_5_VLPreTrainedModel):
         )
         self.gradient_checkpointing = False
 
-    def rot_pos_emb(self, grid_thw):
-        pos_ids = []
-        for t, h, w in grid_thw:
-            hpos_ids = torch.arange(h).unsqueeze(1).expand(-1, w)
-            hpos_ids = hpos_ids.reshape(
-                h // self.spatial_merge_size,
-                self.spatial_merge_size,
-                w // self.spatial_merge_size,
-                self.spatial_merge_size,
-            )
-            hpos_ids = hpos_ids.permute(0, 2, 1, 3)
-            hpos_ids = hpos_ids.flatten()
+    def rot_pos_emb(self, grid_thw, maybe_positions_multiscale=None):
+        if maybe_positions_multiscale is None:
+            pos_ids = []
+            for t, h, w in grid_thw:
+                hpos_ids = torch.arange(h).unsqueeze(1).expand(-1, w)
+                hpos_ids = hpos_ids.reshape(
+                    h // self.spatial_merge_size,
+                    self.spatial_merge_size,
+                    w // self.spatial_merge_size,
+                    self.spatial_merge_size,
+                )
+                hpos_ids = hpos_ids.permute(0, 2, 1, 3)
+                hpos_ids = hpos_ids.flatten()
 
-            wpos_ids = torch.arange(w).unsqueeze(0).expand(h, -1)
-            wpos_ids = wpos_ids.reshape(
-                h // self.spatial_merge_size,
-                self.spatial_merge_size,
-                w // self.spatial_merge_size,
-                self.spatial_merge_size,
-            )
-            wpos_ids = wpos_ids.permute(0, 2, 1, 3)
-            wpos_ids = wpos_ids.flatten()
-            pos_ids.append(torch.stack([hpos_ids, wpos_ids], dim=-1).repeat(t, 1))
-        pos_ids = torch.cat(pos_ids, dim=0)
-        max_grid_size = grid_thw[:, 1:].max()
-        rotary_pos_emb_full = self.rotary_pos_emb(max_grid_size)
-        rotary_pos_emb = rotary_pos_emb_full[pos_ids].flatten(1)
+                wpos_ids = torch.arange(w).unsqueeze(0).expand(h, -1)
+                wpos_ids = wpos_ids.reshape(
+                    h // self.spatial_merge_size,
+                    self.spatial_merge_size,
+                    w // self.spatial_merge_size,
+                    self.spatial_merge_size,
+                )
+                wpos_ids = wpos_ids.permute(0, 2, 1, 3)
+                wpos_ids = wpos_ids.flatten()
+                pos_ids.append(torch.stack([hpos_ids, wpos_ids], dim=-1).repeat(t, 1))
+            pos_ids = torch.cat(pos_ids, dim=0)
+            max_grid_size = grid_thw[:, 1:].max()
+            rotary_pos_emb_full = self.rotary_pos_emb(max_grid_size)
+            rotary_pos_emb = rotary_pos_emb_full[pos_ids].flatten(1)
+        else:
+            max_grid_size = int(maybe_positions_multiscale.max()) + 1
+            rotary_pos_emb_full = self.rotary_pos_emb(max_grid_size)
+            rotary_pos_emb = rotary_pos_emb_full[maybe_positions_multiscale].flatten(1)
+
         return rotary_pos_emb
 
     def get_window_index(self, grid_thw):
@@ -441,7 +447,7 @@ class Qwen2_5_VisionTransformerPretrainedModel(Qwen2_5_VLPreTrainedModel):
             attention_mask[..., cu_seqlens[i - 1] : cu_seqlens[i], cu_seqlens[i - 1] : cu_seqlens[i]] = 0
         return attention_mask
 
-    def forward(self, hidden_states: torch.Tensor, grid_thw: torch.Tensor, **kwargs) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, grid_thw: torch.Tensor, maybe_positions_multiscale: Optional[torch.Tensor] = None, **kwargs) -> torch.Tensor:
         """
         Args:
             hidden_states (`torch.Tensor` of shape `(seq_len, hidden_size)`):
@@ -453,7 +459,7 @@ class Qwen2_5_VisionTransformerPretrainedModel(Qwen2_5_VLPreTrainedModel):
             `torch.Tensor`: hidden_states.
         """
         hidden_states = self.patch_embed(hidden_states)
-        rotary_pos_emb = self.rot_pos_emb(grid_thw)
+        rotary_pos_emb = self.rot_pos_emb(grid_thw, maybe_positions_multiscale=maybe_positions_multiscale)
         window_index, cu_window_seqlens = self.get_window_index(grid_thw)
         cu_window_seqlens = torch.tensor(
             cu_window_seqlens,
@@ -1186,7 +1192,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         video_embeds = torch.split(video_embeds, split_sizes)
         return video_embeds
 
-    def get_image_features(self, pixel_values: torch.FloatTensor, image_grid_thw: Optional[torch.LongTensor] = None):
+    def get_image_features(self, pixel_values: torch.FloatTensor, image_grid_thw: Optional[torch.LongTensor] = None, maybe_positions_multiscale: Optional[torch.Tensor] = None):
         """
         Encodes images into continuous embeddings that can be forwarded to the language model.
 
@@ -1197,7 +1203,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
                 The temporal, height and width of feature shape of each image in LLM.
         """
         pixel_values = pixel_values.type(self.visual.dtype)
-        image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+        image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw, maybe_positions_multiscale=maybe_positions_multiscale)
         split_sizes = (image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()
         image_embeds = torch.split(image_embeds, split_sizes)
         return image_embeds
@@ -1221,6 +1227,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         rope_deltas: Optional[torch.LongTensor] = None,
         cache_position: Optional[torch.LongTensor] = None,
         second_per_grid_ts: Optional[torch.Tensor] = None,
+        maybe_positions_multiscale: Optional[torch.Tensor] = None,
         **kwargs: Unpack[KwargsForCausalLM],
     ) -> Union[tuple, Qwen2_5_VLModelOutputWithPast]:
         r"""
@@ -1247,7 +1254,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings()(input_ids)
             if pixel_values is not None:
-                image_embeds = self.get_image_features(pixel_values, image_grid_thw)
+                image_embeds = self.get_image_features(pixel_values, image_grid_thw, maybe_positions_multiscale=maybe_positions_multiscale)
                 image_embeds = torch.cat(image_embeds, dim=0)
                 n_image_tokens = (input_ids == self.config.image_token_id).sum()
                 n_image_features = image_embeds.shape[0]
@@ -1418,8 +1425,8 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
     ):
         return self.model.get_video_features(pixel_values_videos, video_grid_thw)
 
-    def get_image_features(self, pixel_values: torch.FloatTensor, image_grid_thw: Optional[torch.LongTensor] = None):
-        return self.model.get_image_features(pixel_values, image_grid_thw)
+    def get_image_features(self, pixel_values: torch.FloatTensor, image_grid_thw: Optional[torch.LongTensor] = None, maybe_positions_multiscale: Optional[torch.Tensor] = None):
+        return self.model.get_image_features(pixel_values, image_grid_thw, maybe_positions_multiscale=maybe_positions_multiscale)
 
     # Make modules available throught conditional class for BC
     @property
@@ -1450,6 +1457,7 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         rope_deltas: Optional[torch.LongTensor] = None,
         cache_position: Optional[torch.LongTensor] = None,
         second_per_grid_ts: Optional[torch.Tensor] = None,
+        maybe_positions_multiscale: Optional[torch.Tensor] = None,
         **kwargs: Unpack[KwargsForCausalLM],
     ) -> Union[tuple, Qwen2_5_VLCausalLMOutputWithPast]:
         r"""
@@ -1522,6 +1530,7 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             output_hidden_states=output_hidden_states,
             return_dict=True,
             cache_position=cache_position,
+            maybe_positions_multiscale=maybe_positions_multiscale,
             **kwargs,
         )
 
@@ -1555,6 +1564,7 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         image_grid_thw=None,
         video_grid_thw=None,
         second_per_grid_ts=None,
+        maybe_positions_multiscale=None,
         **kwargs,
     ):
         # Overwritten -- in specific circumstances we don't want to forward image inputs to the model
@@ -1571,6 +1581,7 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             image_grid_thw=image_grid_thw,
             video_grid_thw=video_grid_thw,
             second_per_grid_ts=second_per_grid_ts,
+            maybe_positions_multiscale=maybe_positions_multiscale,
             use_cache=use_cache,
             **kwargs,
         )
@@ -1581,6 +1592,7 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         if cache_position[0] != 0:
             model_inputs["pixel_values"] = None
             model_inputs["pixel_values_videos"] = None
+            model_inputs["maybe_positions_multiscale"] = None
 
         return model_inputs
 
