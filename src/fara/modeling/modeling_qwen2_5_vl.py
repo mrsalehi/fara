@@ -386,6 +386,38 @@ class Qwen2_5_VisionTransformerPretrainedModel(Qwen2_5_VLPreTrainedModel):
             rotary_pos_emb = rotary_pos_emb_full[maybe_positions_multiscale].flatten(1)
 
         return rotary_pos_emb
+    
+    def get_window_index_multiscale(self, grid_thw, centers_multiscale):
+        window_index: list = []
+        cu_window_seqlens: list = [0]
+        window_index_id = 0
+
+        for grid_t, grid_h, grid_w in grid_thw:
+            # n_super_patches = (grid_t * grid_h * grid_w).item()
+            llm_grid_h = grid_h // self.spatial_merge_size
+            llm_grid_w = grid_w // self.spatial_merge_size
+            n_super_patches = (grid_t * llm_grid_h * llm_grid_w).item()
+            
+            centers = centers_multiscale[window_index_id:window_index_id+n_super_patches]
+
+            win_y = centers[:,1] // self.window_size
+            win_x = centers[:,0] // self.window_size
+            try:
+                window_ids = win_y * (win_x.max() + 1) + win_x
+            except:
+                print()
+
+            sorted_perm = torch.argsort(window_ids)
+            window_index.append(sorted_perm + window_index_id)
+
+            _, counts = torch.unique(window_ids, return_counts=True)
+            cu_seqlens_tmp = counts.cumsum(0) * self.spatial_merge_unit + cu_window_seqlens[-1]
+            cu_window_seqlens.extend(cu_seqlens_tmp.tolist())
+
+            window_index_id += n_super_patches
+
+        window_index = torch.cat(window_index, dim=0)
+        return window_index, cu_window_seqlens
 
     def get_window_index(self, grid_thw):
         window_index: list = []
@@ -447,7 +479,13 @@ class Qwen2_5_VisionTransformerPretrainedModel(Qwen2_5_VLPreTrainedModel):
             attention_mask[..., cu_seqlens[i - 1] : cu_seqlens[i], cu_seqlens[i - 1] : cu_seqlens[i]] = 0
         return attention_mask
 
-    def forward(self, hidden_states: torch.Tensor, grid_thw: torch.Tensor, maybe_positions_multiscale: Optional[torch.Tensor] = None, **kwargs) -> torch.Tensor:
+    def forward(
+            self, 
+            hidden_states: torch.Tensor, 
+            grid_thw: torch.Tensor, 
+            maybe_positions_multiscale: Optional[torch.Tensor] = None,
+            maybe_centers_multiscale: Optional[torch.Tensor] = None,
+            **kwargs) -> torch.Tensor:
         """
         Args:
             hidden_states (`torch.Tensor` of shape `(seq_len, hidden_size)`):
@@ -460,7 +498,10 @@ class Qwen2_5_VisionTransformerPretrainedModel(Qwen2_5_VLPreTrainedModel):
         """
         hidden_states = self.patch_embed(hidden_states)
         rotary_pos_emb = self.rot_pos_emb(grid_thw, maybe_positions_multiscale=maybe_positions_multiscale)
-        window_index, cu_window_seqlens = self.get_window_index(grid_thw)
+        if maybe_centers_multiscale is not None:
+            window_index, cu_window_seqlens = self.get_window_index_multiscale(grid_thw, maybe_centers_multiscale)
+        else:
+            window_index, cu_window_seqlens = self.get_window_index(grid_thw)
         cu_window_seqlens = torch.tensor(
             cu_window_seqlens,
             device=hidden_states.device,
@@ -999,6 +1040,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         video_grid_thw: Optional[torch.LongTensor] = None,
         second_per_grid_ts: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        maybe_centers_multiscale: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Calculate the 3D rope index based on image and video's temporal, height and width in LLM.
@@ -1054,74 +1096,62 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
             mrope_position_deltas (`torch.Tensor` of shape `(batch_size)`)
         """
         spatial_merge_size = self.config.vision_config.spatial_merge_size
+        patch_size = self.config.vision_config.patch_size
         image_token_id = self.config.image_token_id
         video_token_id = self.config.video_token_id
         vision_start_token_id = self.config.vision_start_token_id
         mrope_position_deltas = []
-        if input_ids is not None and (image_grid_thw is not None or video_grid_thw is not None):
+
+        if maybe_centers_multiscale is not None:
+            # NOTE: here we're assuming there are no video inputs in the context as
+            # FARA agent does not take any video inputs.
             total_input_ids = input_ids
-            if attention_mask is None:
-                attention_mask = torch.ones_like(total_input_ids)
             position_ids = torch.ones(
                 3,
                 input_ids.shape[0],
                 input_ids.shape[1],
                 dtype=input_ids.dtype,
-                device=input_ids.device,
+                device=input_ids.device
             )
-            image_index, video_index = 0, 0
+            image_index = 0
+            super_patch_offset = 0
+            if attention_mask is None:
+                attention_mask = torch.ones_like(total_input_ids)
             attention_mask = attention_mask.to(total_input_ids.device)
             for i, input_ids in enumerate(total_input_ids):
                 input_ids = input_ids[attention_mask[i] == 1]
-                image_nums, video_nums = 0, 0
+                image_nums = 0
                 vision_start_indices = torch.argwhere(input_ids == vision_start_token_id).squeeze(1)
-                vision_tokens = input_ids[vision_start_indices + 1]
+                vision_tokens = input_ids[vision_start_indices + 1] 
                 image_nums = (vision_tokens == image_token_id).sum()
-                video_nums = (vision_tokens == video_token_id).sum()
-                input_tokens = input_ids.tolist()
+                input_tokens = input_ids.tolist() 
                 llm_pos_ids_list: list = []
                 st = 0
-                remain_images, remain_videos = image_nums, video_nums
-                for _ in range(image_nums + video_nums):
+                remain_images = image_nums
+                for _ in range(image_nums):
                     if image_token_id in input_tokens and remain_images > 0:
                         ed_image = input_tokens.index(image_token_id, st)
                     else:
                         ed_image = len(input_tokens) + 1
-                    if video_token_id in input_tokens and remain_videos > 0:
-                        ed_video = input_tokens.index(video_token_id, st)
-                    else:
-                        ed_video = len(input_tokens) + 1
-                    if ed_image < ed_video:
-                        t, h, w = (
-                            image_grid_thw[image_index][0],
-                            image_grid_thw[image_index][1],
-                            image_grid_thw[image_index][2],
-                        )
-                        second_per_grid_t = 0
-                        image_index += 1
-                        remain_images -= 1
-                        ed = ed_image
-
-                    else:
-                        t, h, w = (
-                            video_grid_thw[video_index][0],
-                            video_grid_thw[video_index][1],
-                            video_grid_thw[video_index][2],
-                        )
-                        if second_per_grid_ts is not None:
-                            second_per_grid_t = second_per_grid_ts[video_index]
-                        else:
-                            second_per_grid_t = 1.0
-                        video_index += 1
-                        remain_videos -= 1
-                        ed = ed_video
+                    
+                    t, h, w = (
+                        image_grid_thw[image_index][0],
+                        image_grid_thw[image_index][1],
+                        image_grid_thw[image_index][2],
+                    )
+                    second_per_grid_t = 0
+                    image_index += 1
+                    remain_images -= 1
+                    ed = ed_image
                     llm_grid_t, llm_grid_h, llm_grid_w = (
                         t.item(),
                         h.item() // spatial_merge_size,
                         w.item() // spatial_merge_size,
                     )
+                    num_super_patches = (llm_grid_t*llm_grid_h*llm_grid_w)   # total for this image
+                    centers_this_image = maybe_centers_multiscale[
+                        super_patch_offset:super_patch_offset+llm_grid_t*llm_grid_h*llm_grid_w].cpu()
                     text_len = ed - st
-
                     st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
                     llm_pos_ids_list.append(torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx)
 
@@ -1132,16 +1162,18 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
                     second_per_grid_t = torch.as_tensor(
                         second_per_grid_t, dtype=range_tensor.dtype, device=range_tensor.device
                     )
-
                     time_tensor = expanded_range * second_per_grid_t * self.config.vision_config.tokens_per_second
-
                     time_tensor_long = time_tensor.long()
                     t_index = time_tensor_long.flatten()
 
-                    h_index = torch.arange(llm_grid_h).view(1, -1, 1).expand(llm_grid_t, -1, llm_grid_w).flatten()
-                    w_index = torch.arange(llm_grid_w).view(1, 1, -1).expand(llm_grid_t, llm_grid_h, -1).flatten()
+                    # h_index = torch.arange(llm_grid_h).view(1, -1, 1).expand(llm_grid_t, -1, llm_grid_w).flatten()
+                    h_index = centers_this_image[:, 1] // (patch_size * spatial_merge_size)
+                    # w_index = torch.arange(llm_grid_w).view(1, 1, -1).expand(llm_grid_t, llm_grid_h, -1).flatten()
+                    w_index = centers_this_image[:, 0] // (patch_size * spatial_merge_size)
                     llm_pos_ids_list.append(torch.stack([t_index, h_index, w_index]) + text_len + st_idx)
-                    st = ed + llm_grid_t * llm_grid_h * llm_grid_w
+                    # st = ed + llm_grid_t * llm_grid_h * llm_grid_w
+                    st = ed + num_super_patches
+                    super_patch_offset += num_super_patches
 
                 if st < len(input_tokens):
                     st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
@@ -1151,26 +1183,124 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
                 llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1)
                 position_ids[..., i, attention_mask[i] == 1] = llm_positions.to(position_ids.device)
                 mrope_position_deltas.append(llm_positions.max() + 1 - len(total_input_ids[i]))
+ 
             mrope_position_deltas = torch.tensor(mrope_position_deltas, device=input_ids.device).unsqueeze(1)
             return position_ids, mrope_position_deltas
+
         else:
-            if attention_mask is not None:
-                position_ids = attention_mask.long().cumsum(-1) - 1
-                position_ids.masked_fill_(attention_mask == 0, 1)
-                position_ids = position_ids.unsqueeze(0).expand(3, -1, -1).to(attention_mask.device)
-                max_position_ids = position_ids.max(0, keepdim=False)[0].max(-1, keepdim=True)[0]
-                mrope_position_deltas = max_position_ids + 1 - attention_mask.shape[-1]
-            else:
-                position_ids = (
-                    torch.arange(input_ids.shape[1], device=input_ids.device)
-                    .view(1, 1, -1)
-                    .expand(3, input_ids.shape[0], -1)
-                )
-                mrope_position_deltas = torch.zeros(
-                    [input_ids.shape[0], 1],
-                    device=input_ids.device,
+            if input_ids is not None and (image_grid_thw is not None or video_grid_thw is not None):
+                total_input_ids = input_ids
+                if attention_mask is None:
+                    attention_mask = torch.ones_like(total_input_ids)
+                position_ids = torch.ones(
+                    3,
+                    input_ids.shape[0],
+                    input_ids.shape[1],
                     dtype=input_ids.dtype,
+                    device=input_ids.device,
                 )
+                image_index, video_index = 0, 0
+                attention_mask = attention_mask.to(total_input_ids.device)
+                for i, input_ids in enumerate(total_input_ids):
+                    input_ids = input_ids[attention_mask[i] == 1]
+                    image_nums, video_nums = 0, 0
+                    vision_start_indices = torch.argwhere(input_ids == vision_start_token_id).squeeze(1)
+                    vision_tokens = input_ids[vision_start_indices + 1]
+                    image_nums = (vision_tokens == image_token_id).sum()
+                    video_nums = (vision_tokens == video_token_id).sum()
+                    input_tokens = input_ids.tolist()
+                    llm_pos_ids_list: list = []
+                    st = 0
+                    remain_images, remain_videos = image_nums, video_nums
+                    for _ in range(image_nums + video_nums):
+                        if image_token_id in input_tokens and remain_images > 0:
+                            ed_image = input_tokens.index(image_token_id, st)
+                        else:
+                            ed_image = len(input_tokens) + 1
+                        if video_token_id in input_tokens and remain_videos > 0:
+                            ed_video = input_tokens.index(video_token_id, st)
+                        else:
+                            ed_video = len(input_tokens) + 1
+                        if ed_image < ed_video:
+                            t, h, w = (
+                                image_grid_thw[image_index][0],
+                                image_grid_thw[image_index][1],
+                                image_grid_thw[image_index][2],
+                            )
+                            second_per_grid_t = 0
+                            image_index += 1
+                            remain_images -= 1
+                            ed = ed_image
+
+                        else:
+                            t, h, w = (
+                                video_grid_thw[video_index][0],
+                                video_grid_thw[video_index][1],
+                                video_grid_thw[video_index][2],
+                            )
+                            if second_per_grid_ts is not None:
+                                second_per_grid_t = second_per_grid_ts[video_index]
+                            else:
+                                second_per_grid_t = 1.0
+                            video_index += 1
+                            remain_videos -= 1
+                            ed = ed_video
+                        llm_grid_t, llm_grid_h, llm_grid_w = (
+                            t.item(),
+                            h.item() // spatial_merge_size,
+                            w.item() // spatial_merge_size,
+                        )
+                        text_len = ed - st
+
+                        st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
+                        llm_pos_ids_list.append(torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx)
+
+                        range_tensor = torch.arange(llm_grid_t).view(-1, 1)
+                        expanded_range = range_tensor.expand(-1, llm_grid_h * llm_grid_w)
+
+                        ## normalize type, send to device.
+                        second_per_grid_t = torch.as_tensor(
+                            second_per_grid_t, dtype=range_tensor.dtype, device=range_tensor.device
+                        )
+
+                        time_tensor = expanded_range * second_per_grid_t * self.config.vision_config.tokens_per_second
+
+                        time_tensor_long = time_tensor.long()
+                        t_index = time_tensor_long.flatten()
+
+                        h_index = torch.arange(llm_grid_h).view(1, -1, 1).expand(llm_grid_t, -1, llm_grid_w).flatten()
+                        w_index = torch.arange(llm_grid_w).view(1, 1, -1).expand(llm_grid_t, llm_grid_h, -1).flatten()
+                        llm_pos_ids_list.append(torch.stack([t_index, h_index, w_index]) + text_len + st_idx)
+                        st = ed + llm_grid_t * llm_grid_h * llm_grid_w
+
+                    if st < len(input_tokens):
+                        st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
+                        text_len = len(input_tokens) - st
+                        llm_pos_ids_list.append(torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx)
+
+                    llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1)
+                    position_ids[..., i, attention_mask[i] == 1] = llm_positions.to(position_ids.device)
+                    mrope_position_deltas.append(llm_positions.max() + 1 - len(total_input_ids[i]))
+                mrope_position_deltas = torch.tensor(mrope_position_deltas, device=input_ids.device).unsqueeze(1)
+                return position_ids, mrope_position_deltas
+            else:
+                if attention_mask is not None:
+                    position_ids = attention_mask.long().cumsum(-1) - 1
+                    position_ids.masked_fill_(attention_mask == 0, 1)
+                    position_ids = position_ids.unsqueeze(0).expand(3, -1, -1).to(attention_mask.device)
+                    max_position_ids = position_ids.max(0, keepdim=False)[0].max(-1, keepdim=True)[0]
+                    mrope_position_deltas = max_position_ids + 1 - attention_mask.shape[-1]
+                else:
+                    position_ids = (
+                        torch.arange(input_ids.shape[1], device=input_ids.device)
+                        .view(1, 1, -1)
+                        .expand(3, input_ids.shape[0], -1)
+                    )
+                    mrope_position_deltas = torch.zeros(
+                        [input_ids.shape[0], 1],
+                        device=input_ids.device,
+                        dtype=input_ids.dtype,
+                    )
 
             return position_ids, mrope_position_deltas
 
@@ -1192,7 +1322,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         video_embeds = torch.split(video_embeds, split_sizes)
         return video_embeds
 
-    def get_image_features(self, pixel_values: torch.FloatTensor, image_grid_thw: Optional[torch.LongTensor] = None, maybe_positions_multiscale: Optional[torch.Tensor] = None):
+    def get_image_features(self, pixel_values: torch.FloatTensor, image_grid_thw: Optional[torch.LongTensor] = None, maybe_positions_multiscale: Optional[torch.Tensor] = None, maybe_centers_multiscale: Optional[torch.Tensor] = None):
         """
         Encodes images into continuous embeddings that can be forwarded to the language model.
 
@@ -1203,7 +1333,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
                 The temporal, height and width of feature shape of each image in LLM.
         """
         pixel_values = pixel_values.type(self.visual.dtype)
-        image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw, maybe_positions_multiscale=maybe_positions_multiscale)
+        image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw, maybe_positions_multiscale=maybe_positions_multiscale, maybe_centers_multiscale=maybe_centers_multiscale)
         split_sizes = (image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()
         image_embeds = torch.split(image_embeds, split_sizes)
         return image_embeds
@@ -1228,6 +1358,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         cache_position: Optional[torch.LongTensor] = None,
         second_per_grid_ts: Optional[torch.Tensor] = None,
         maybe_positions_multiscale: Optional[torch.Tensor] = None,
+        maybe_centers_multiscale: Optional[torch.Tensor] = None,
         **kwargs: Unpack[KwargsForCausalLM],
     ) -> Union[tuple, Qwen2_5_VLModelOutputWithPast]:
         r"""
@@ -1254,7 +1385,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings()(input_ids)
             if pixel_values is not None:
-                image_embeds = self.get_image_features(pixel_values, image_grid_thw, maybe_positions_multiscale=maybe_positions_multiscale)
+                image_embeds = self.get_image_features(pixel_values, image_grid_thw, maybe_positions_multiscale=maybe_positions_multiscale, maybe_centers_multiscale=maybe_centers_multiscale)
                 image_embeds = torch.cat(image_embeds, dim=0)
                 n_image_tokens = (input_ids == self.config.image_token_id).sum()
                 n_image_features = image_embeds.shape[0]
@@ -1317,6 +1448,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
                     video_grid_thw,
                     second_per_grid_ts=second_per_grid_ts,
                     attention_mask=attention_mask_tensor,
+                    maybe_centers_multiscale=maybe_centers_multiscale
                 )
                 self.rope_deltas = rope_deltas
             # then use the prev pre-calculated rope-deltas to get the correct position ids
@@ -1425,8 +1557,8 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
     ):
         return self.model.get_video_features(pixel_values_videos, video_grid_thw)
 
-    def get_image_features(self, pixel_values: torch.FloatTensor, image_grid_thw: Optional[torch.LongTensor] = None, maybe_positions_multiscale: Optional[torch.Tensor] = None):
-        return self.model.get_image_features(pixel_values, image_grid_thw, maybe_positions_multiscale=maybe_positions_multiscale)
+    def get_image_features(self, pixel_values: torch.FloatTensor, image_grid_thw: Optional[torch.LongTensor] = None, maybe_positions_multiscale: Optional[torch.Tensor] = None, maybe_centers_multiscale: Optional[torch.Tensor] = None):
+        return self.model.get_image_features(pixel_values, image_grid_thw, maybe_positions_multiscale=maybe_positions_multiscale, maybe_centers_multiscale=maybe_centers_multiscale)
 
     # Make modules available throught conditional class for BC
     @property
@@ -1458,6 +1590,7 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         cache_position: Optional[torch.LongTensor] = None,
         second_per_grid_ts: Optional[torch.Tensor] = None,
         maybe_positions_multiscale: Optional[torch.Tensor] = None,
+        maybe_centers_multiscale: Optional[torch.Tensor] = None,
         **kwargs: Unpack[KwargsForCausalLM],
     ) -> Union[tuple, Qwen2_5_VLCausalLMOutputWithPast]:
         r"""
@@ -1531,6 +1664,7 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             return_dict=True,
             cache_position=cache_position,
             maybe_positions_multiscale=maybe_positions_multiscale,
+            maybe_centers_multiscale=maybe_centers_multiscale,
             **kwargs,
         )
 
@@ -1565,6 +1699,7 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         video_grid_thw=None,
         second_per_grid_ts=None,
         maybe_positions_multiscale=None,
+        maybe_centers_multiscale=None,
         **kwargs,
     ):
         # Overwritten -- in specific circumstances we don't want to forward image inputs to the model
@@ -1582,6 +1717,7 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             video_grid_thw=video_grid_thw,
             second_per_grid_ts=second_per_grid_ts,
             maybe_positions_multiscale=maybe_positions_multiscale,
+            maybe_centers_multiscale=maybe_centers_multiscale,
             use_cache=use_cache,
             **kwargs,
         )
@@ -1593,6 +1729,7 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             model_inputs["pixel_values"] = None
             model_inputs["pixel_values_videos"] = None
             model_inputs["maybe_positions_multiscale"] = None
+            model_inputs["maybe_centers_multiscale"] = None
 
         return model_inputs
 

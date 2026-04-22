@@ -366,6 +366,7 @@ class Qwen2VLImageProcessor(BaseImageProcessor):
         else:
             patches = np.concatenate(patches_multi_scale, axis=0)[None, ...]  # shape: (1, num_patches, patch_size, patch_size, 3)
             positions_multi_scale = np.concatenate(positions_multi_scale, axis=0)
+            centers_multi_scale = np.concatenate(centers_multi_scale, axis=0)
 
         if data_format == ChannelDimension.LAST:
             if patches.ndim == 4:
@@ -406,9 +407,9 @@ class Qwen2VLImageProcessor(BaseImageProcessor):
             grid_h = 2
             grid_w = num_patches // 2
             flatten_patches = patches.transpose(1, 2, 0, 3, 4).reshape(-1, temporal_patch_size*patch_size*patch_size*3)
-            return flatten_patches, (grid_t, grid_h, grid_w), positions_multi_scale
+            return flatten_patches, (grid_t, grid_h, grid_w), positions_multi_scale, centers_multi_scale
 
-        return flatten_patches, (grid_t, grid_h, grid_w), None
+        return flatten_patches, (grid_t, grid_h, grid_w), None, None
 
     def _compute_trajectory_patches(
         self,
@@ -667,9 +668,10 @@ class Qwen2VLImageProcessor(BaseImageProcessor):
             )
             self._maybe_visualize_trajectory(traj_data)
             pixel_values, vision_grid_thws = [], []
-            for image in images:
-                per_frame = traj_data['per_frame'] if traj_data is not None else None
-                patches, image_grid_thw, maybe_positions_multiscale = self._preprocess(
+            all_positions, all_centers = [], []
+            for idx, image in enumerate(images):
+                per_frame = [traj_data['per_frame'][idx]] if traj_data is not None else None
+                patches, image_grid_thw, pos_ms, ctr_ms = self._preprocess(
                     image,
                     do_resize=do_resize,
                     size=size,
@@ -689,12 +691,16 @@ class Qwen2VLImageProcessor(BaseImageProcessor):
                 )
                 pixel_values.extend(patches)
                 vision_grid_thws.append(image_grid_thw)
+                if pos_ms is not None:
+                    all_positions.append(pos_ms)
+                    all_centers.append(ctr_ms)
             pixel_values = np.array(pixel_values)
             vision_grid_thws = np.array(vision_grid_thws)
             data.update({
-                "pixel_values": pixel_values, 
+                "pixel_values": pixel_values,
                 "image_grid_thw": vision_grid_thws,
-                "maybe_positions_multiscale": maybe_positions_multiscale,
+                "maybe_positions_multiscale": np.concatenate(all_positions, axis=0) if all_positions else None,
+                "maybe_centers_multiscale": np.concatenate(all_centers,   axis=0) if all_centers   else None,
             })
 
         # kept for BC only and should be removed after v5.0
