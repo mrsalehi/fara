@@ -402,10 +402,7 @@ class Qwen2_5_VisionTransformerPretrainedModel(Qwen2_5_VLPreTrainedModel):
 
             win_y = centers[:,1] // self.window_size
             win_x = centers[:,0] // self.window_size
-            try:
-                window_ids = win_y * (win_x.max() + 1) + win_x
-            except:
-                print()
+            window_ids = win_y * (win_x.max() + 1) + win_x
 
             sorted_perm = torch.argsort(window_ids)
             window_index.append(sorted_perm + window_index_id)
