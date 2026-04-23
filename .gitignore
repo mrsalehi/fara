@@ -192,3 +192,6 @@ webeval/data/webvoyager/WebVoyager_arxiv_only.jsonl
 webeval/scripts/mlflow.db
 webeval/scripts/stdout.txt
 webeval/scripts/tmp/
+
+results/
+fara-traj-viz-debug/
