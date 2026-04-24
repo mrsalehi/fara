@@ -73,6 +73,7 @@ class WebSurferSystem(BaseSystem):
         save_env_state: bool = False,
         use_local_model: bool = False,
         local_model_id: str = "microsoft/Fara-7B",
+        use_multiscale: bool = True,
     ) -> None:
         super().__init__(system_name)
         self.web_surfer_model_type = web_surfer_model_type
@@ -87,6 +88,7 @@ class WebSurferSystem(BaseSystem):
         self.step_budgets = step_budgets or []
         self.use_local_model = use_local_model
         self.local_model_id = local_model_id
+        self.use_multiscale = use_multiscale
 
         ### add a bool to save env_state
         self.save_env_state=save_env_state
@@ -201,6 +203,7 @@ class WebSurferSystem(BaseSystem):
                     logger=logger,
                     use_local_model=self.use_local_model,
                     local_model_id=self.local_model_id,
+                    use_multiscale=self.use_multiscale,
                 )
 
                 await agent.initialize()

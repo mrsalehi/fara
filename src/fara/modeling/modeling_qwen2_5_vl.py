@@ -402,7 +402,7 @@ class Qwen2_5_VisionTransformerPretrainedModel(Qwen2_5_VLPreTrainedModel):
 
             win_y = centers[:,1] // self.window_size
             win_x = centers[:,0] // self.window_size
-            window_ids = win_y * (win_x.max() + 1) + win_x
+            window_ids = win_y * (win_x.max() + 1) + win_x  # only used for sorting and giving some order to windows
 
             sorted_perm = torch.argsort(window_ids)
             window_index.append(sorted_perm + window_index_id)
@@ -1330,7 +1330,11 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
                 The temporal, height and width of feature shape of each image in LLM.
         """
         pixel_values = pixel_values.type(self.visual.dtype)
-        image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw, maybe_positions_multiscale=maybe_positions_multiscale, maybe_centers_multiscale=maybe_centers_multiscale)
+        image_embeds = self.visual(
+            pixel_values, 
+            grid_thw=image_grid_thw, 
+            maybe_positions_multiscale=maybe_positions_multiscale, 
+            maybe_centers_multiscale=maybe_centers_multiscale)
         split_sizes = (image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()
         image_embeds = torch.split(image_embeds, split_sizes)
         return image_embeds

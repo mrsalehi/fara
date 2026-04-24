@@ -165,6 +165,7 @@ class Qwen2VLImageProcessor(BaseImageProcessor):
         self.merge_size = merge_size
         self.do_convert_rgb = do_convert_rgb
         self.scales = [0, 1, 2, 3]
+        self.use_multiscale = True
 
     def _preprocess(
         self,
@@ -656,16 +657,19 @@ class Qwen2VLImageProcessor(BaseImageProcessor):
 
         data = {}
         if images is not None:
-            traj_data = self._compute_trajectory_patches(
-                images,
-                do_convert_rgb=do_convert_rgb,
-                do_resize=do_resize,
-                size=size,
-                resample=resample,
-                patch_size=patch_size,
-                merge_size=merge_size,
-                input_data_format=input_data_format,
-            )
+            if self.use_multiscale:
+                traj_data = self._compute_trajectory_patches(
+                    images,
+                    do_convert_rgb=do_convert_rgb,
+                    do_resize=do_resize,
+                    size=size,
+                    resample=resample,
+                    patch_size=patch_size,
+                    merge_size=merge_size,
+                    input_data_format=input_data_format,
+                )
+            else:
+                traj_data = None
             self._maybe_visualize_trajectory(traj_data)
             pixel_values, vision_grid_thws = [], []
             all_positions, all_centers = [], []
@@ -699,9 +703,11 @@ class Qwen2VLImageProcessor(BaseImageProcessor):
             data.update({
                 "pixel_values": pixel_values,
                 "image_grid_thw": vision_grid_thws,
-                "maybe_positions_multiscale": np.concatenate(all_positions, axis=0) if all_positions else None,
-                "maybe_centers_multiscale": np.concatenate(all_centers,   axis=0) if all_centers   else None,
             })
+            if all_positions:
+                data["maybe_positions_multiscale"] = np.concatenate(all_positions, axis=0)
+            if all_centers:
+                data["maybe_centers_multiscale"] = np.concatenate(all_centers, axis=0)
 
         # kept for BC only and should be removed after v5.0
         if videos is not None:

@@ -59,6 +59,7 @@ class FaraAgent:
         logger: logging.Logger | None = None,
         use_local_model: bool = False,
         local_model_id: str = "microsoft/Fara-7B",
+        use_multiscale: bool = True,
     ):
         self.downloads_folder = downloads_folder
         if not os.path.exists(self.downloads_folder or "") and self.downloads_folder:
@@ -87,6 +88,7 @@ class FaraAgent:
         self.include_input_text_key_args = True
         self.use_local_model = use_local_model
         self.local_model_id = local_model_id
+        self.use_multiscale = use_multiscale
 
         def _download_handler(download: Download) -> None:
             self._last_download = download
@@ -135,6 +137,8 @@ class FaraAgent:
         self._local_processor.image_processor = Qwen2VLImageProcessor.from_pretrained(
             self.local_model_id
         )
+        self._local_processor.image_processor.use_multiscale = self.use_multiscale
+        self.logger.info(f"Image processor use_multiscale={self.use_multiscale}")
         self._local_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             self.local_model_id,
             torch_dtype=torch.bfloat16,

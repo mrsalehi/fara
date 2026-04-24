@@ -58,6 +58,7 @@ def add_webvoyager_args(parser):
     parser.add_argument('--eval_data_url', type=str, default = DEFAULT_DATA_URL, help='Azure URI to the evaluation data (None for vanilla webvoyager)')
     parser.add_argument('--local', action='store_true', help='Run model locally instead of calling a vLLM API endpoint')
     parser.add_argument('--local_model_id', type=str, default='microsoft/Fara-7B', help='HuggingFace model ID for local inference')
+    parser.add_argument('--no_multiscale', action='store_true', help='Disable multi-scale patching in the image processor (single-scale fallback)')
 
 
 def main():
@@ -125,6 +126,7 @@ def main():
             step_budgets=args.step_budgets,
             use_local_model=args.local,
             local_model_id=args.local_model_id,
+            use_multiscale=not args.no_multiscale,
         )
 
 
