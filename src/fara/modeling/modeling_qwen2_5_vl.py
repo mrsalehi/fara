@@ -41,7 +41,15 @@ from transformers.modeling_outputs import BaseModelOutputWithPast, ModelOutput
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
-from transformers.utils import LossKwargs, auto_docstring, can_return_tuple, is_torchdynamo_compiling, logging
+from transformers.utils import auto_docstring, can_return_tuple, is_torchdynamo_compiling, logging
+
+try:
+    from transformers.utils import LossKwargs
+except ImportError:
+    from typing import TypedDict
+
+    class LossKwargs(TypedDict, total=False):
+        num_items_in_batch: Optional[int]
 from .configuration_qwen2_5_vl import Qwen2_5_VLConfig, Qwen2_5_VLTextConfig, Qwen2_5_VLVisionConfig
 
 
