@@ -257,7 +257,7 @@ def diff_frame(curr_arr, prev_aligned, mse_thresh, var_thresh):
 # Process a full trajectory
 # ---------------------------------------------------------------------------
 
-def is_blank_frame(arr, max_var=1.0):
+def is_blank_frame(arr, max_var=0.0):
     """Check if a frame is essentially blank (all white, all black, etc.)."""
     return float(np.var(arr.astype(np.float32))) <= max_var
 
@@ -289,21 +289,12 @@ def process_trajectory(images, var_thresh=100.0, mse_thresh=10.0):
         img = load_frame(item)
         frames.append((img, np.array(img)))
 
-    # Skip leading blank frames
+    # NOTE: leading-blank skip and trailing-dup drop are handled upstream in
+    # the dataset adapter (row_to_messages). Doing it here too would risk
+    # cascading drops that desync `per_frame` from the caller's image list.
     n_skipped_blank = 0
-    while n_skipped_blank < len(frames) and is_blank_frame(frames[n_skipped_blank][1]):
-        n_skipped_blank += 1
-
-    # Drop trailing duplicate frame
     trailing_dup_dropped = False
-    if len(frames) - n_skipped_blank >= 2:
-        last_arr = frames[-1][1]
-        penult_arr = frames[-2][1]
-        if frames_identical(last_arr, penult_arr):
-            trailing_dup_dropped = True
-
-    end = len(frames) - (1 if trailing_dup_dropped else 0)
-    active_frames = frames[n_skipped_blank:end]
+    active_frames = frames
 
     results = []
     prev_arr = None
