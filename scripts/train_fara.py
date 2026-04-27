@@ -1,0 +1,912 @@
+"""
+SFT training script for Fara-7B.
+
+Supports:
+  * Full fine-tune and LoRA (--lora)
+  * Multi-scale patches and single-scale (--no_multiscale)
+  * Single-GPU, and multi-GPU via `accelerate launch` / `torchrun`
+
+Data assumptions (MolmoWeb-SyntheticTrajs parquet):
+  * Columns include: sample_id, instruction, trajectory, images
+  * `images`    : list of dicts with a "bytes" key (PNG-encoded frames)
+  * `trajectory`: list of step dicts. This script assumes each step is a dict
+    with fields that can be serialized to text (e.g. {"thought", "action"}).
+    ADJUST `row_to_messages` below if your schema differs.
+
+Install deps in the training env (NOT the fara_webeval env):
+    pip install "trl>=0.12" "transformers>=4.46" peft accelerate datasets \
+                pyarrow bitsandbytes
+"""
+
+import argparse
+import io
+import json
+import os
+import re
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
+
+# Prevent DeepSpeed import-time CUDA op probing from failing when using FSDP-only training.
+os.environ.setdefault("DS_IGNORE_CUDA_DETECTION", "1")
+
+import numpy as np
+import torch
+from datasets import load_dataset
+from PIL import Image
+from transformers import Qwen2_5_VLProcessor
+
+from fara.modeling.modeling_qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
+from fara.modeling.image_processing_qwen2_vl import Qwen2VLImageProcessor
+from fara._prompts import get_computer_use_system_prompt
+
+
+# ---------------------------------------------------------------------------
+# Production-aligned constants (mirror src/fara/fara_agent.py FaraAgent)
+# ---------------------------------------------------------------------------
+
+MLM_PROCESSOR_IM_CFG = {
+    "min_pixels": 3136,
+    "max_pixels": 12845056,
+    "patch_size": 14,
+    "merge_size": 2,
+}
+USER_MESSAGE = "Here is the next screenshot. Think about what to do next."
+FN_CALL_TEMPLATE_NAME = "default"
+TOOL_NAME = "computer_use"   # the only function registered in fara's <tools> block
+MAX_URL_LENGTH = 100         # mirrors FaraAgent.MAX_URL_LENGTH
+
+
+# ---------------------------------------------------------------------------
+# Dataset adapter: parquet row -> chat messages
+# ---------------------------------------------------------------------------
+
+def _decode_image(img_entry: Any) -> Image.Image:
+    """Decode one image entry. Schema-tolerant."""
+    if isinstance(img_entry, Image.Image):
+        return img_entry.convert("RGB")
+    if isinstance(img_entry, dict) and "bytes" in img_entry and img_entry["bytes"] is not None:
+        raw = img_entry["bytes"]
+    elif isinstance(img_entry, dict) and "path" in img_entry and img_entry["path"]:
+        return Image.open(img_entry["path"]).convert("RGB")
+    elif isinstance(img_entry, (bytes, bytearray)):
+        raw = bytes(img_entry)
+    else:
+        raise TypeError(f"Unexpected image entry type: {type(img_entry)}")
+    return Image.open(io.BytesIO(raw)).convert("RGB")
+
+
+# Map dataset action names to fara's `computer_use` action enum
+# (src/fara/_prompts.py FaraComputerUse.parameters.properties.action.enum).
+_ACTION_ALIASES = {
+    # clicks
+    "click":          "left_click",
+    "left_click":     "left_click",
+    # typing / keys
+    "type":           "type",
+    "keyboard_type":  "type",
+    "key":            "key",
+    "keyboard_press": "key",
+    "press":          "key",
+    # mouse movement / scrolling
+    "mouse_move":     "mouse_move",
+    "scroll":         "scroll",
+    # navigation
+    "goto":           "visit_url",
+    "visit_url":      "visit_url",
+    "web_search":     "web_search",
+    "history_back":   "history_back",
+    # misc
+    "wait":           "wait",
+    "terminate":      "terminate",
+    "pause_and_memorize_fact": "pause_and_memorize_fact",
+}
+
+# Argument keys fara's `computer_use` tool recognizes. Anything else gets dropped
+# from training assistant messages so we don't bake non-schema fields (bid, bbox,
+# node_properties, ...) into the model.
+_FARA_ARG_KEYS = {
+    "action", "coordinate", "keys", "text",
+    "press_enter", "delete_existing_text",
+    "pixels", "url", "query", "fact", "time", "status",
+}
+
+
+def _normalize_action_name(name: Any) -> Any:
+    if not isinstance(name, str):
+        return name
+    normalized = name.strip().lower()
+    return _ACTION_ALIASES.get(normalized, normalized)
+
+
+def _bbox_xywh_to_coordinate(bbox: Any) -> Optional[List[int]]:
+    """Convert (x, y, w, h) bounding box to a single (cx, cy) center point."""
+    if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+        return None
+    try:
+        x, y, w, h = (float(v) for v in bbox)
+    except (TypeError, ValueError):
+        return None
+    return [round(x + w / 2.0), round(y + h / 2.0)]
+
+
+def _normalize_scroll_pixels(raw_args: Dict[str, Any]) -> Optional[int]:
+    """Map the dataset's scroll magnitude into fara's `pixels` arg.
+
+    Dataset convention (from action_description): positive `delta_y` = scroll
+    DOWN. Fara convention (FaraComputerUse.parameters): positive `pixels` =
+    scroll UP. So pixels = -delta_y. Horizontal `delta_x` is dropped (fara has
+    no separate horizontal-scroll arg).
+    """
+    for key in ("delta_y", "scroll_y", "dy"):
+        v = raw_args.get(key)
+        if isinstance(v, (int, float)):
+            return -int(round(float(v)))
+    # Pass-through if the dataset already uses fara's own field name.
+    v = raw_args.get("pixels")
+    if isinstance(v, (int, float)):
+        return int(round(float(v)))
+    return None
+
+
+def _coerce_to_fara_args(action_name: Optional[str], raw_args: Dict[str, Any]) -> Dict[str, Any]:
+    """Build a fara-schema-compatible arguments dict from arbitrary raw args.
+
+    * Pulls `coordinate` out of `bbox` (x,y,w,h) when needed.
+    * Maps the dataset's `delta_y` to fara's `pixels` for scroll (with sign flip).
+    * Coerces `keys` from string to list.
+    * Drops any keys not in the fara schema so we don't pollute training.
+    """
+    args: Dict[str, Any] = {}
+    if action_name:
+        args["action"] = action_name
+
+    # Coordinate: prefer explicit, else derive from bbox center.
+    if action_name in {"left_click", "mouse_move", "type"}:
+        coord = raw_args.get("coordinate")
+        if (not isinstance(coord, (list, tuple)) or len(coord) != 2) and "bbox" in raw_args:
+            coord = _bbox_xywh_to_coordinate(raw_args["bbox"])
+        if isinstance(coord, (list, tuple)) and len(coord) == 2:
+            args["coordinate"] = [round(float(coord[0])), round(float(coord[1]))]
+
+    # Scroll: derive `pixels` from delta_y (with sign flip).
+    if action_name == "scroll":
+        pixels = _normalize_scroll_pixels(raw_args)
+        if pixels is not None:
+            args["pixels"] = pixels
+
+    # Type: extract trailing newline -> press_enter. Datasets often encode
+    # "type then submit" by appending '\n' to the text; fara's runtime expects
+    # an explicit `press_enter` boolean (defaulting True if missing, which is
+    # surprising — so we always set it explicitly).
+    if action_name == "type":
+        text = raw_args.get("text")
+        if isinstance(text, str):
+            stripped = text.rstrip("\r\n")
+            args["text"] = stripped
+            args["press_enter"] = stripped != text  # True iff we removed a newline
+        if "delete_existing_text" in raw_args:
+            args["delete_existing_text"] = bool(raw_args["delete_existing_text"])
+
+    # `keys` should be a list per the schema; coerce singular `key` and string forms.
+    if action_name == "key":
+        keys = raw_args.get("keys")
+        if keys is None:
+            keys = raw_args.get("key")           # dataset sometimes uses singular `key`
+        if isinstance(keys, str):
+            keys = [keys]
+        if isinstance(keys, list):
+            args["keys"] = keys
+
+    # Terminate: ensure `status` is always set (schema requires it).
+    if action_name == "terminate":
+        status = raw_args.get("status")
+        args["status"] = status if status in ("success", "failure") else "success"
+
+    # Carry through any other recognized fields verbatim.
+    for k, v in raw_args.items():
+        if k in _FARA_ARG_KEYS and k not in args:
+            args[k] = v
+
+    return args
+
+
+def _format_assistant_message(step: Any) -> str:
+    """Build a production-format assistant turn from a trajectory step.
+
+    Output mirrors what fara emits at inference (parsed by
+    `FaraAgent._parse_thoughts_and_action`):
+
+        <thought text>
+        <tool_call>
+        {"name": "computer_use", "arguments": {"action": <name>, ...}}
+        </tool_call>
+
+    The thought is a free-text prefix, NOT inside arguments — fara's runtime
+    extracts it from the leading text and only then adds it to arguments.
+    """
+    if isinstance(step, str):
+        return step
+
+    if not isinstance(step, dict):
+        return str(step)
+
+    thought: Optional[str] = None
+    action_name: Optional[str] = None
+    action_args: Dict[str, Any] = {}
+
+    # Molmo/WebVoyager-style nested action payload.
+    action_block = step.get("action") if isinstance(step.get("action"), dict) else None
+    if action_block is not None:
+        ao = action_block.get("action_output") if isinstance(action_block.get("action_output"), dict) else {}
+        if isinstance(ao, dict):
+            thought = ao.get("thought")
+            action_name = _normalize_action_name(ao.get("action_name"))
+            inner_action = ao.get("action")
+            if isinstance(inner_action, dict):
+                action_args.update(inner_action)
+        # Some datasets store the args dict on the action_block directly.
+        for key in ("arguments", "args"):
+            maybe_args = action_block.get(key)
+            if isinstance(maybe_args, dict):
+                action_args.update(maybe_args)
+
+    # Flat-dict fallback: {"thought": ..., "action": "<name>" or {...}}.
+    if action_name is None:
+        if isinstance(step.get("action"), str):
+            action_name = _normalize_action_name(step["action"])
+        elif isinstance(step.get("action_name"), str):
+            action_name = _normalize_action_name(step["action_name"])
+    if thought is None and isinstance(step.get("thought"), str):
+        thought = step["thought"]
+    if not action_args and isinstance(step.get("arguments"), dict):
+        action_args.update(step["arguments"])
+
+    # If the inner action dict carried its own action name, prefer it (matches
+    # production where arguments["action"] is the sub-action of computer_use).
+    if action_name is None and isinstance(action_args.get("action"), str):
+        action_name = _normalize_action_name(action_args["action"])
+
+    # `send_msg_to_user` isn't a fara action, but its semantics are "report the
+    # final answer and stop." Production fara reads `final_answer = thoughts`
+    # right before a `terminate` (fara_agent.py:513-515). So fold the message
+    # into the thought and emit terminate(status="success").
+    if action_name == "send_msg_to_user":
+        msg = (action_args.get("msg")
+               or action_args.get("message")
+               or action_args.get("text"))
+        if isinstance(msg, str) and msg.strip():
+            base = (thought or "").strip()
+            thought = (base + "\n\n" + msg.strip()).strip() if base else msg.strip()
+        action_name = "terminate"
+        action_args = {}
+
+    # Coerce raw args to fara's schema: bbox -> coordinate, drop non-schema keys,
+    # remap action names (e.g. "click" -> "left_click").
+    fara_args = _coerce_to_fara_args(action_name, action_args)
+
+    if not fara_args.get("action"):
+        # Nothing usable; fall back to a JSON dump so we don't silently drop info.
+        return json.dumps(step, ensure_ascii=False)
+
+    tool_call_obj = {"name": TOOL_NAME, "arguments": fara_args}
+    tool_call_block = "<tool_call>\n" + json.dumps(tool_call_obj, ensure_ascii=False) + "\n</tool_call>"
+
+    if thought:
+        return f"{thought.strip()}\n{tool_call_block}"
+    return tool_call_block
+
+
+def _parse_trajectory(raw_trajectory: Any) -> List[Any]:
+    """Normalize trajectory payload into an ordered list of step objects."""
+    traj = raw_trajectory
+
+    if isinstance(traj, str):
+        try:
+            traj = json.loads(traj)
+        except Exception:
+            return []
+
+    if isinstance(traj, list):
+        return traj
+
+    if isinstance(traj, dict):
+        # Many datasets store steps as {"1": {...}, "2": {...}}.
+        if all(isinstance(k, str) and k.isdigit() for k in traj.keys()):
+            return [traj[k] for k in sorted(traj.keys(), key=lambda x: int(x))]
+        return list(traj.values())
+
+    return []
+
+
+def _normalize_url(u: Any) -> Optional[str]:
+    if not isinstance(u, str):
+        return None
+    u = u.strip()
+    if not u:
+        return None
+    if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", u):
+        u = "https://" + u
+    return u
+
+
+def _extract_domain(u: str) -> Optional[str]:
+    try:
+        netloc = urlparse(u).netloc.lower().strip()
+    except Exception:
+        return None
+    if not netloc:
+        return None
+    if netloc.startswith("www."):
+        netloc = netloc[4:]
+    return netloc or None
+
+
+def _domain_allowed(domain: str, allowed_domains: List[str]) -> bool:
+    # Allow exact match and subdomains (e.g., export.arxiv.org for arxiv.org).
+    for allowed in allowed_domains:
+        if domain == allowed or domain.endswith("." + allowed):
+            return True
+    return False
+
+
+def _extract_step_urls(step: Any) -> List[str]:
+    if not isinstance(step, dict):
+        return []
+
+    urls: List[str] = []
+
+    # Browser observation URLs.
+    other_obs = step.get("other_obs", {}) if isinstance(step.get("other_obs", {}), dict) else {}
+    if isinstance(other_obs.get("url"), str):
+        urls.append(other_obs["url"])
+    open_pages_urls = other_obs.get("open_pages_urls", [])
+    if isinstance(open_pages_urls, list):
+        urls.extend([u for u in open_pages_urls if isinstance(u, str)])
+
+    # Nested action URL.
+    action_block = step.get("action", {}) if isinstance(step.get("action", {}), dict) else {}
+    action_output = action_block.get("action_output", {}) if isinstance(action_block.get("action_output", {}), dict) else {}
+    action_obj = action_output.get("action", {}) if isinstance(action_output.get("action", {}), dict) else {}
+    if isinstance(action_obj.get("url"), str):
+        urls.append(action_obj["url"])
+
+    # Parse strings like goto(url='...') and visit_url(url='...').
+    action_str = action_block.get("action_str")
+    if isinstance(action_str, str):
+        m = re.search(r"(?:goto|visit_url)\s*\(\s*url\s*=\s*['\"]([^'\"]+)['\"]", action_str)
+        if m:
+            urls.append(m.group(1))
+
+    return urls
+
+
+def _extract_row_domains(raw_trajectory: Any) -> List[str]:
+    steps = _parse_trajectory(raw_trajectory)
+    domains: List[str] = []
+    for step in steps:
+        for raw_url in _extract_step_urls(step):
+            normalized = _normalize_url(raw_url)
+            if not normalized:
+                continue
+            domain = _extract_domain(normalized)
+            if domain:
+                domains.append(domain)
+    return domains
+
+
+def _validate_image_step_alignment(images: List[Any], steps: List[Any], sample_id: Any = None) -> None:
+    """Check that image path aligns with step screenshot for each paired frame."""
+    mode = os.getenv("FARA_VALIDATE_IMAGE_STEP_ALIGNMENT", "strict").strip().lower()
+    if mode in {"0", "off", "false", "none"}:
+        return
+
+    mismatches = []
+    for i, (img, step) in enumerate(zip(images, steps)):
+        if not isinstance(img, dict) or not isinstance(step, dict):
+            continue
+        img_path = img.get("path")
+        screenshot = step.get("screenshot")
+        if not img_path or not screenshot:
+            continue
+
+        img_name = os.path.basename(str(img_path))
+        shot_name = os.path.basename(str(screenshot))
+        if img_name != shot_name:
+            mismatches.append((i, img_name, shot_name))
+
+    if not mismatches:
+        return
+
+    sid = "unknown" if sample_id is None else str(sample_id)
+    detail = ", ".join([f"idx={i}: image='{ip}' vs step='{sp}'" for i, ip, sp in mismatches[:5]])
+    msg = f"[fara-train] image/trajectory mismatch sample_id={sid}: {detail}"
+
+    if mode in {"strict", "error", "raise"}:
+        raise ValueError(msg)
+    print(msg)
+
+
+def _get_step_url(step: Any) -> Optional[str]:
+    """Extract the active URL for a step (matches what fara reads at runtime)."""
+    if not isinstance(step, dict):
+        return None
+    other_obs = step.get("other_obs") if isinstance(step.get("other_obs"), dict) else {}
+    url = other_obs.get("url") if isinstance(other_obs, dict) else None
+    if isinstance(url, str) and url.strip():
+        return url.strip()
+    # Fallback to the first URL of any kind we can find for this step.
+    urls = _extract_step_urls(step)
+    return urls[0] if urls else None
+
+
+def _trim_url(url: str, max_len: int = MAX_URL_LENGTH) -> str:
+    if len(url) <= max_len:
+        return url
+    return url[: max_len - 3] + "..."
+
+
+def _build_system_prompt_for_image(image_for_dims: Any) -> str:
+    """Build the production system prompt (with <tools> block) using the
+    image's dimensions so display_width_px / display_height_px match what the
+    runtime would produce for the same screenshot.
+    """
+    pil = _decode_image(image_for_dims)
+    info = get_computer_use_system_prompt(
+        pil,
+        MLM_PROCESSOR_IM_CFG,
+        include_input_text_key_args=True,
+        fn_call_template=FN_CALL_TEMPLATE_NAME,
+    )
+    return _extract_system_prompt_text(info)
+
+
+def row_to_messages(row: Dict[str, Any], system_prompt_text: Optional[str] = None) -> Dict[str, Any]:
+    """Convert one parquet row to Qwen2.5-VL chat messages + raw image entries.
+
+    Mirrors fara's production message layout (see src/fara/fara_agent.py):
+      * System: full <tools>-aware prompt from get_computer_use_system_prompt,
+        sized to the first screenshot's dims.
+      * Turn 0:        user(image, <task instruction>)
+      * Turn i > 0:    user(image, "Current URL: <trimmed_url>\\n<USER_MESSAGE>")
+      * Each assistant: <thought>\\n<tool_call>{"name":"computer_use",...}</tool_call>
+
+    Returns:
+        {"messages": [...], "images": [<raw image entries>]}
+    """
+    sample_id = row.get("sample_id")
+    instruction: str = str(row.get("instruction", ""))
+    images_raw: List[Any] = row["images"]
+    trajectory_raw = row.get("trajectory", [])
+
+    # Keep raw image payloads in the dataset and decode in the collator.
+    # This avoids serializing PIL objects through datasets map workers.
+    images = list(images_raw)
+    steps = _parse_trajectory(trajectory_raw)
+
+    # Align images and steps. If mismatched, truncate to the shorter.
+    n = min(len(images), len(steps))
+    images = images[:n]
+    steps = steps[:n]
+
+    # Optional sanity check for datasets that provide image path + step screenshot keys.
+    _validate_image_step_alignment(images, steps, sample_id=sample_id)
+
+    if system_prompt_text is None and images:
+        try:
+            system_prompt_text = _build_system_prompt_for_image(images[0])
+        except Exception as e:
+            print(f"[fara-train] failed to build production system prompt "
+                  f"(sample_id={sample_id}): {e}; falling back to generic.")
+    if not system_prompt_text:
+        system_prompt_text = (
+            "You are a web agent. Given a screenshot and an instruction, "
+            "produce the next action to take."
+        )
+
+    messages: List[Dict[str, Any]] = [
+        {"role": "system",
+         "content": [{"type": "text", "text": system_prompt_text}]},
+    ]
+    for i, (img, step) in enumerate(zip(images, steps)):
+        if i == 0:
+            user_text = instruction
+        else:
+            url = _get_step_url(step)
+            url_prefix = f"Current URL: {_trim_url(url)}\n" if url else ""
+            user_text = f"{url_prefix}{USER_MESSAGE}"
+
+        messages.append({
+            "role": "user",
+            "content": [
+                {"type": "image"},
+                {"type": "text", "text": user_text},
+            ],
+        })
+        messages.append({
+            "role": "assistant",
+            "content": [{"type": "text", "text": _format_assistant_message(step)}],
+        })
+    return {"messages": messages, "images": images}
+
+
+def _extract_system_prompt_text(prompt_info: Dict[str, Any]) -> str:
+    """Flatten system message text from get_computer_use_system_prompt output."""
+    chunks: List[str] = []
+    for msg in prompt_info.get("conversation", []):
+        if msg.get("role") != "system":
+            continue
+        for item in msg.get("content", []):
+            text = item.get("text") if isinstance(item, dict) else None
+            if text:
+                chunks.append(text)
+    return "\n".join(chunks).strip()
+
+
+# ---------------------------------------------------------------------------
+# Collator: builds input_ids, labels with assistant-only masking, and batches
+# the variable-length vision tensors (pixel_values, grid_thw, multi-scale).
+# ---------------------------------------------------------------------------
+
+ASSISTANT_HEADER = "<|im_start|>assistant\n"
+TURN_END = "<|im_end|>"
+
+
+@dataclass
+class FaraCollator:
+    processor: Any
+    max_seq_length: int = 8192
+    use_multiscale: bool = True
+
+    def __post_init__(self) -> None:
+        tok = self.processor.tokenizer
+        # Pre-tokenize the assistant header so we can locate it in input_ids.
+        # Qwen uses `<|im_start|>`, `assistant`, `\n` as separate or combined
+        # tokens depending on version; tokenize both the header and `<|im_end|>`
+        # without special tokens, then pattern-match.
+        self._assistant_header_ids = tok.encode(ASSISTANT_HEADER, add_special_tokens=False)
+        self._turn_end_ids = tok.encode(TURN_END, add_special_tokens=False)
+        self.processor.image_processor.use_multiscale = self.use_multiscale
+
+    def _build_labels(self, input_ids: List[int]) -> List[int]:
+        """Mask everything except assistant completions."""
+        labels = [-100] * len(input_ids)
+        n = len(input_ids)
+        hdr = self._assistant_header_ids
+        end = self._turn_end_ids
+        i = 0
+        while i <= n - len(hdr):
+            if input_ids[i : i + len(hdr)] == hdr:
+                start = i + len(hdr)
+                # find the next <|im_end|> occurrence
+                j = start
+                while j <= n - len(end):
+                    if input_ids[j : j + len(end)] == end:
+                        break
+                    j += 1
+                stop = min(j + len(end), n)   # include <|im_end|> in labels
+                for k in range(start, stop):
+                    labels[k] = input_ids[k]
+                i = stop
+            else:
+                i += 1
+        return labels
+
+    def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+        tok = self.processor.tokenizer
+        texts: List[str] = []
+        images_per_sample: List[List[Image.Image]] = []
+        for ex in batch:
+            text = self.processor.apply_chat_template(
+                ex["messages"], tokenize=False, add_generation_prompt=False,
+            )
+            texts.append(text)
+            images_per_sample.append([_decode_image(img) for img in ex["images"]])
+
+        # Run the processor per-sample so image_grid_thw rows align with samples.
+        # We will then concatenate pixel tensors across the batch (Qwen-VL style).
+        per_sample = []
+        for text, imgs in zip(texts, images_per_sample):
+            enc = self.processor(
+                text=[text],
+                images=imgs if imgs else None,
+                padding=False,
+                truncation=True,
+                max_length=self.max_seq_length,
+                return_tensors="pt",
+            )
+            per_sample.append(enc)
+
+        # --- pad input_ids / attention_mask / build labels ---
+        pad_id = tok.pad_token_id
+        if pad_id is None:
+            pad_id = tok.eos_token_id
+
+        max_len = max(enc["input_ids"].shape[1] for enc in per_sample)
+        input_ids = torch.full((len(per_sample), max_len), pad_id, dtype=torch.long)
+        attention_mask = torch.zeros_like(input_ids)
+        labels = torch.full_like(input_ids, -100)
+
+        for i, enc in enumerate(per_sample):
+            ids = enc["input_ids"][0].tolist()
+            L = len(ids)
+            input_ids[i, :L] = torch.tensor(ids, dtype=torch.long)
+            attention_mask[i, :L] = 1
+            sample_labels = self._build_labels(ids)
+            labels[i, :L] = torch.tensor(sample_labels, dtype=torch.long)
+
+        out: Dict[str, torch.Tensor] = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+        }
+
+        # --- concat vision tensors across the batch ---
+        if any("pixel_values" in e for e in per_sample):
+            pvs = [e["pixel_values"] for e in per_sample if "pixel_values" in e]
+            grids = [e["image_grid_thw"] for e in per_sample if "image_grid_thw" in e]
+            out["pixel_values"] = torch.cat(pvs, dim=0)
+            out["image_grid_thw"] = torch.cat(grids, dim=0)
+
+            if self.use_multiscale and "maybe_positions_multiscale" in per_sample[0]:
+                mp = [e["maybe_positions_multiscale"] for e in per_sample
+                      if "maybe_positions_multiscale" in e]
+                mc = [e["maybe_centers_multiscale"] for e in per_sample
+                      if "maybe_centers_multiscale" in e]
+                out["maybe_positions_multiscale"] = torch.cat(mp, dim=0)
+                out["maybe_centers_multiscale"] = torch.cat(mc, dim=0)
+
+        return out
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser()
+
+    # Data / model / output
+    p.add_argument("--data_path", required=True,
+                   help="Parquet file or directory of parquet files.")
+    p.add_argument("--model_id", default="microsoft/Fara-7B")
+    p.add_argument("--output_dir", required=True)
+
+    # Training hyperparams
+    p.add_argument("--per_device_batch_size", type=int, default=1)
+    p.add_argument("--gradient_accumulation_steps", type=int, default=8)
+    p.add_argument("--learning_rate", type=float, default=1e-5)
+    p.add_argument("--num_epochs", type=float, default=1.0)
+    p.add_argument("--max_seq_length", type=int, default=8192)
+    p.add_argument("--warmup_ratio", type=float, default=0.03)
+    p.add_argument("--weight_decay", type=float, default=0.0)
+    p.add_argument("--logging_steps", type=int, default=10)
+    p.add_argument("--save_steps", type=int, default=500)
+    p.add_argument("--max_samples", type=int, default=None,
+                   help="Cap dataset size (useful for smoke tests).")
+    p.add_argument(
+        "--allowed_domains",
+        default="",
+        help=(
+            "Comma-separated allowlist for training domains (e.g., 'arxiv.org,allrecipes.com'). "
+            "Rows are filtered before training when set."
+        ),
+    )
+    p.add_argument(
+        "--domain_filter_mode",
+        default="any",
+        choices=["any", "strict"],
+        help=(
+            "Domain filtering mode when --allowed_domains is set: "
+            "'any' keeps rows with at least one allowed domain in trajectory; "
+            "'strict' keeps rows only if all observed domains are in allowlist."
+        ),
+    )
+    p.add_argument("--report_to", default="none",
+                   help="Logging backend(s): 'none', 'wandb', or comma-separated values accepted by Transformers.")
+
+    # Toggles
+    p.add_argument("--no_multiscale", action="store_true",
+                   help="Disable multi-scale patching (single-scale path).")
+    p.add_argument("--lora", action="store_true",
+                   help="LoRA fine-tune instead of full fine-tune.")
+    p.add_argument("--freeze_vision", action="store_true",
+                   help="Freeze the vision tower (full FT only).")
+    p.add_argument("--bf16", action="store_true", default=True)
+    p.add_argument("--fp16", action="store_true")
+    p.add_argument("--gradient_checkpointing", action="store_true", default=True)
+    p.add_argument("--attn_implementation", default="sdpa",
+                   choices=["sdpa", "eager", "flash_attention_2", "flash_attention_3"],
+                   help="Attention kernel. sdpa is safest; FA2/FA3 require the "
+                        "model to explicitly advertise support.")
+    p.add_argument("--fsdp", default="",
+                   help="Comma-separated FSDP options, e.g. 'full_shard,auto_wrap'.")
+    p.add_argument("--fsdp_config", default=None,
+                   help="Path to FSDP config json file.")
+
+    # LoRA knobs
+    p.add_argument("--lora_r", type=int, default=16)
+    p.add_argument("--lora_alpha", type=int, default=32)
+    p.add_argument("--lora_dropout", type=float, default=0.05)
+    p.add_argument("--lora_target_modules", default="q_proj,k_proj,v_proj,o_proj",
+                   help="Comma-separated list of module name suffixes.")
+
+    return p.parse_args()
+
+
+def load_processor_and_model(args: argparse.Namespace):
+    processor = Qwen2_5_VLProcessor.from_pretrained(args.model_id)
+    processor.image_processor = Qwen2VLImageProcessor.from_pretrained(args.model_id)
+    processor.image_processor.use_multiscale = not args.no_multiscale
+
+    dtype = torch.bfloat16 if args.bf16 and not args.fp16 else (
+        torch.float16 if args.fp16 else torch.float32
+    )
+    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        args.model_id,
+        torch_dtype=dtype,
+        attn_implementation=args.attn_implementation,
+    )
+
+    if args.freeze_vision and not args.lora:
+        for p in model.visual.parameters():
+            p.requires_grad = False
+
+    if args.gradient_checkpointing:
+        model.gradient_checkpointing_enable()
+        model.config.use_cache = False
+
+    return processor, model
+
+
+def maybe_wrap_peft(model, args):
+    if not args.lora:
+        return model, None
+    from peft import LoraConfig
+
+    target_modules = [m.strip() for m in args.lora_target_modules.split(",") if m.strip()]
+    lora_config = LoraConfig(
+        r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        bias="none",
+        task_type="CAUSAL_LM",
+        target_modules=target_modules,
+    )
+    # Let SFTTrainer apply PEFT from `peft_config` to avoid double-wrapping.
+    return model, lora_config
+
+
+def build_dataset(args: argparse.Namespace, processor: Qwen2_5_VLProcessor):
+    ds = load_dataset("parquet", data_files=args.data_path, split="train")
+
+    allowed_domains = [d.strip().lower() for d in args.allowed_domains.split(",") if d.strip()]
+    allowed_domains = [d[4:] if d.startswith("www.") else d for d in allowed_domains]
+    if allowed_domains:
+        print(f"[fara-train] applying domain allowlist ({args.domain_filter_mode}): {allowed_domains}")
+
+        def _keep_row(row: Dict[str, Any]) -> bool:
+            domains = _extract_row_domains(row.get("trajectory"))
+            if not domains:
+                return False
+
+            if args.domain_filter_mode == "strict":
+                return all(_domain_allowed(d, allowed_domains) for d in domains)
+
+            # args.domain_filter_mode == "any"
+            return any(_domain_allowed(d, allowed_domains) for d in domains)
+
+        before = len(ds)
+        ds = ds.filter(_keep_row, num_proc=4)
+        after = len(ds)
+        print(f"[fara-train] domain filter kept {after}/{before} rows")
+
+        if after == 0:
+            raise ValueError(
+                "Domain filter removed all rows. Verify --allowed_domains and trajectory URL extraction."
+            )
+
+    if args.max_samples is not None:
+        ds = ds.select(range(min(args.max_samples, len(ds))))
+
+    # Match Fara agent runtime prompt format as closely as possible.
+    sample = ds[0]
+    sample_images = sample.get("images", [])
+    if len(sample_images) > 0:
+        first_image = _decode_image(sample_images[0])
+        im_proc = processor.image_processor
+        prompt_info = get_computer_use_system_prompt(
+            first_image,
+            {
+                "patch_size": im_proc.patch_size,
+                "merge_size": im_proc.merge_size,
+                "min_pixels": im_proc.min_pixels,
+                "max_pixels": im_proc.max_pixels,
+            },
+            include_input_text_key_args=False,
+            fn_call_template="default",
+        )
+        system_prompt_text = _extract_system_prompt_text(prompt_info)
+    else:
+        system_prompt_text = None
+
+    ds = ds.map(
+        row_to_messages,
+        fn_kwargs={"system_prompt_text": system_prompt_text},
+        remove_columns=ds.column_names,
+        num_proc=4,
+    )
+    return ds
+
+
+def main() -> None:
+    args = parse_args()
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    from trl import SFTConfig, SFTTrainer
+
+    print(f"[fara-train] multi-scale = {not args.no_multiscale}")
+    print(f"[fara-train] LoRA        = {args.lora}")
+
+    processor, model = load_processor_and_model(args)
+    model, lora_config = maybe_wrap_peft(model, args)
+
+    dataset = build_dataset(args, processor)
+    print(f"[fara-train] dataset size = {len(dataset)}")
+
+    collator = FaraCollator(
+        processor=processor,
+        max_seq_length=args.max_seq_length,
+        use_multiscale=not args.no_multiscale,
+    )
+
+    fsdp_options: List[str] = []
+    if args.fsdp:
+        fsdp_options = [opt.strip() for opt in args.fsdp.split(",") if opt.strip()]
+
+    # Avoid passing None: some TRL/Transformers versions do membership checks on fsdp.
+    fsdp_value = fsdp_options if fsdp_options else ""
+
+    report_to = [x.strip() for x in args.report_to.split(",") if x.strip()]
+    if len(report_to) == 0 or report_to == ["none"]:
+        report_to = []
+
+    train_args = SFTConfig(
+        output_dir=args.output_dir,
+        per_device_train_batch_size=args.per_device_batch_size,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        num_train_epochs=args.num_epochs,
+        learning_rate=args.learning_rate,
+        warmup_ratio=args.warmup_ratio,
+        weight_decay=args.weight_decay,
+        logging_steps=args.logging_steps,
+        save_steps=args.save_steps,
+        bf16=args.bf16 and not args.fp16,
+        fp16=args.fp16,
+        gradient_checkpointing=args.gradient_checkpointing,
+        remove_unused_columns=False,
+        dataset_kwargs={"skip_prepare_dataset": True},
+        max_length=args.max_seq_length,
+        report_to=report_to,
+        save_total_limit=3,
+        optim="adamw_torch",
+        fsdp=fsdp_value,
+        fsdp_config=args.fsdp_config,
+    )
+
+    trainer = SFTTrainer(
+        model=model,
+        args=train_args,
+        train_dataset=dataset,
+        data_collator=collator,
+        processing_class=processor,
+        peft_config=lora_config,
+    )
+
+    trainer.train()
+    trainer.save_model(args.output_dir)
+    processor.save_pretrained(args.output_dir)
+
+
+if __name__ == "__main__":
+    main()
