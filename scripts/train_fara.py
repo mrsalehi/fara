@@ -52,6 +52,7 @@ MLM_PROCESSOR_IM_CFG = {
     "merge_size": 2,
 }
 USER_MESSAGE = "Here is the next screenshot. Think about what to do next."
+USER_MESSAGE_REDUNDANT = "The screenshot is unchanged from the previous step. Think about what to do next."
 FN_CALL_TEMPLATE_NAME = "default"
 TOOL_NAME = "computer_use"   # the only function registered in fara's <tools> block
 MAX_URL_LENGTH = 100         # mirrors FaraAgent.MAX_URL_LENGTH
@@ -74,6 +75,17 @@ def _decode_image(img_entry: Any) -> Image.Image:
     else:
         raise TypeError(f"Unexpected image entry type: {type(img_entry)}")
     return Image.open(io.BytesIO(raw)).convert("RGB")
+
+
+def _is_blank_image_entry(img_entry: Any, max_var: float = 0.0) -> bool:
+    """Return True if the image is perfectly uniform (variance == 0).
+    PNG is lossless so a true about:blank viewport has exactly zero variance.
+    """
+    try:
+        arr = np.asarray(_decode_image(img_entry), dtype=np.float32)
+    except Exception:
+        return False
+    return float(arr.var()) <= max_var
 
 
 # Map dataset action names to fara's `computer_use` action enum
@@ -211,8 +223,12 @@ def _coerce_to_fara_args(action_name: Optional[str], raw_args: Dict[str, Any]) -
     return args
 
 
-def _format_assistant_message(step: Any) -> str:
+def _format_assistant_message(step: Any) -> Optional[str]:
     """Build a production-format assistant turn from a trajectory step.
+
+    Returns None when the step's action has no fara-compatible mapping
+    (e.g. `noop`, `dblclick`, `tab_focus`). The caller drops the whole
+    trajectory if any step here returns None — keeps causality intact.
 
     Output mirrors what fara emits at inference (parsed by
     `FaraAgent._parse_thoughts_and_action`):
@@ -281,13 +297,28 @@ def _format_assistant_message(step: Any) -> str:
         action_name = "terminate"
         action_args = {}
 
+    # `browser_nav` covers history navigation. Only `go_back` maps to a fara
+    # action (history_back). Other nav_types (tab_focus, ...) have no fara
+    # equivalent and signal that the trajectory should be dropped.
+    if action_name == "browser_nav":
+        nav_type = action_args.get("nav_type")
+        if nav_type == "go_back":
+            action_name = "history_back"
+            action_args = {}
+        else:
+            return None    # tab_focus / others -> drop trajectory
+
+    # Actions with no fara mapping. Returning None tells the caller to drop the
+    # whole trajectory so we don't introduce unexplained state transitions.
+    if action_name in {"noop", "dblclick"}:
+        return None
+
     # Coerce raw args to fara's schema: bbox -> coordinate, drop non-schema keys,
     # remap action names (e.g. "click" -> "left_click").
     fara_args = _coerce_to_fara_args(action_name, action_args)
 
     if not fara_args.get("action"):
-        # Nothing usable; fall back to a JSON dump so we don't silently drop info.
-        return json.dumps(step, ensure_ascii=False)
+        return None        # unrecognized; drop trajectory
 
     tool_call_obj = {"name": TOOL_NAME, "arguments": fara_args}
     tool_call_block = "<tool_call>\n" + json.dumps(tool_call_obj, ensure_ascii=False) + "\n</tool_call>"
@@ -492,6 +523,58 @@ def row_to_messages(row: Dict[str, Any], system_prompt_text: Optional[str] = Non
     # Optional sanity check for datasets that provide image path + step screenshot keys.
     _validate_image_step_alignment(images, steps, sample_id=sample_id)
 
+    # Decode all images once and reuse across the three pixel-level checks
+    # below (leading-blank, trailing-dup, mid-trajectory-dup).
+    arrays: List[Optional[np.ndarray]] = []
+    for img in images:
+        try:
+            arrays.append(np.asarray(_decode_image(img), dtype=np.uint8))
+        except Exception:
+            arrays.append(None)
+
+    def _arrs_equal(a: Optional[np.ndarray], b: Optional[np.ndarray]) -> bool:
+        return (a is not None and b is not None
+                and a.shape == b.shape and np.array_equal(a, b))
+
+    # 1) Leading blank prefix (variance == 0 -> about:blank). Drop their pixels;
+    # keep step[0] as the "task -> first action" signal but drop any later
+    # pre-render steps since their actions weren't informed by anything visible.
+    n_leading_blank = 0
+    while (n_leading_blank < len(arrays) and arrays[n_leading_blank] is not None
+           and float(arrays[n_leading_blank].astype(np.float32).var()) == 0.0):
+        n_leading_blank += 1
+    images = images[n_leading_blank:]
+    arrays = arrays[n_leading_blank:]
+    if n_leading_blank > 1:
+        steps = [steps[0]] + steps[n_leading_blank:]
+
+    # 2) Trailing duplicate: redundant terminal observation (e.g. [EXIT] ping
+    # after the answer was already sent). Drop image AND step.
+    if len(arrays) >= 2 and len(steps) >= 2 and _arrs_equal(arrays[-1], arrays[-2]):
+        images = images[:-1]
+        arrays = arrays[:-1]
+        steps  = steps[:-1]
+
+    # 3) Mid-trajectory duplicate: this frame is pixel-identical to the previous
+    # one (the action didn't visually change the page). Drop the image, keep
+    # the step; the user-turn text gets a marker so the model knows there was
+    # a screenshot but it's unchanged.
+    n_steps = len(steps)
+    step_has_image = [True] * n_steps
+    if n_leading_blank > 0 and n_steps > 0:
+        step_has_image[0] = False   # leading-blank task turn
+
+    new_images: List[Any] = []
+    prev_arr: Optional[np.ndarray] = None
+    for img_idx, arr in enumerate(arrays):
+        step_idx = img_idx + (1 if n_leading_blank > 0 else 0)
+        if _arrs_equal(prev_arr, arr) and step_idx < n_steps:
+            step_has_image[step_idx] = False
+        else:
+            new_images.append(images[img_idx])
+        prev_arr = arr
+    images = new_images
+
     if system_prompt_text is None and images:
         try:
             system_prompt_text = _build_system_prompt_for_image(images[0])
@@ -504,28 +587,37 @@ def row_to_messages(row: Dict[str, Any], system_prompt_text: Optional[str] = Non
             "produce the next action to take."
         )
 
+    # Format every assistant turn first. If ANY step has no fara mapping, drop
+    # the whole trajectory by returning empty messages/images — easier to
+    # filter post-map than to truncate / skip and risk causality breaks.
+    formatted_steps: List[str] = []
+    for step in steps:
+        text = _format_assistant_message(step)
+        if text is None:
+            return {"messages": [], "images": []}
+        formatted_steps.append(text)
+
     messages: List[Dict[str, Any]] = [
         {"role": "system",
          "content": [{"type": "text", "text": system_prompt_text}]},
     ]
-    for i, (img, step) in enumerate(zip(images, steps)):
+    for i, (step, assistant_text) in enumerate(zip(steps, formatted_steps)):
+        has_image = step_has_image[i]
         if i == 0:
             user_text = instruction
         else:
             url = _get_step_url(step)
             url_prefix = f"Current URL: {_trim_url(url)}\n" if url else ""
-            user_text = f"{url_prefix}{USER_MESSAGE}"
+            suffix = USER_MESSAGE if has_image else USER_MESSAGE_REDUNDANT
+            user_text = f"{url_prefix}{suffix}"
 
-        messages.append({
-            "role": "user",
-            "content": [
-                {"type": "image"},
-                {"type": "text", "text": user_text},
-            ],
-        })
+        user_content: List[Dict[str, Any]] = [{"type": "text", "text": user_text}]
+        if has_image:
+            user_content.insert(0, {"type": "image"})
+        messages.append({"role": "user", "content": user_content})
         messages.append({
             "role": "assistant",
-            "content": [{"type": "text", "text": _format_assistant_message(step)}],
+            "content": [{"type": "text", "text": assistant_text}],
         })
     return {"messages": messages, "images": images}
 
@@ -557,8 +649,12 @@ class FaraCollator:
     processor: Any
     max_seq_length: int = 8192
     use_multiscale: bool = True
+    sampling_strategy: str = "decision_point"    # decision_point: sample one t per row
+    max_n_images: int = 3                  # mirror FaraAgent.max_n_images at runtime
 
     def __post_init__(self) -> None:
+        import random as _random   # local import to avoid global pollution
+        self._rng = _random.Random()
         tok = self.processor.tokenizer
         # Pre-tokenize the assistant header so we can locate it in input_ids.
         # Qwen uses `<|im_start|>`, `assistant`, `\n` as separate or combined
@@ -568,28 +664,81 @@ class FaraCollator:
         self._turn_end_ids = tok.encode(TURN_END, add_special_tokens=False)
         self.processor.image_processor.use_multiscale = self.use_multiscale
 
-    def _build_labels(self, input_ids: List[int]) -> List[int]:
-        """Mask everything except assistant completions."""
+    def _truncate_to_decision_point(
+        self,
+        messages: List[Dict[str, Any]],
+        images: List[Any],
+        t: int,
+    ) -> tuple:
+        """Slice the trajectory to end at assistant turn `t`, keeping images
+        only for user turns in [t - max_n_images + 1, t]. Older user turns
+        keep their text but lose their image placeholder.
+        """
+        # Layout: [system, user_0, assistant_0, user_1, assistant_1, ...]
+        # assistant_t is at index 2t + 2; slice end-exclusive at 2t + 3.
+        end_idx = 2 * t + 3
+        truncated = messages[:end_idx]
+
+        keep_image_start = max(0, t - self.max_n_images + 1)
+
+        new_messages: List[Dict[str, Any]] = []
+        new_images: List[Any] = []
+        user_turn_idx = 0
+        img_idx = 0   # advances only on user turns that carry an image placeholder
+        for msg in truncated:
+            if msg["role"] == "user":
+                has_image = any(isinstance(c, dict) and c.get("type") == "image"
+                                for c in msg["content"])
+                if user_turn_idx >= keep_image_start:
+                    new_messages.append(msg)
+                    if has_image:
+                        new_images.append(images[img_idx])
+                else:
+                    text_only = [c for c in msg["content"]
+                                 if not (isinstance(c, dict) and c.get("type") == "image")]
+                    new_messages.append({"role": "user", "content": text_only})
+                if has_image:
+                    img_idx += 1
+                user_turn_idx += 1
+            else:
+                new_messages.append(msg)
+
+        return new_messages, new_images
+
+    def _build_labels(self, input_ids: List[int], last_only: bool = False) -> List[int]:
+        """Mask everything except assistant completions.
+
+        If `last_only=True`, only the FINAL assistant span is unmasked — used
+        with Strategy A so we only train on the prediction at the sampled
+        decision point (earlier assistant turns are context, not targets).
+        """
         labels = [-100] * len(input_ids)
         n = len(input_ids)
         hdr = self._assistant_header_ids
         end = self._turn_end_ids
+
+        spans = []   # list of (start, stop) for each assistant span
         i = 0
         while i <= n - len(hdr):
             if input_ids[i : i + len(hdr)] == hdr:
                 start = i + len(hdr)
-                # find the next <|im_end|> occurrence
                 j = start
                 while j <= n - len(end):
                     if input_ids[j : j + len(end)] == end:
                         break
                     j += 1
-                stop = min(j + len(end), n)   # include <|im_end|> in labels
-                for k in range(start, stop):
-                    labels[k] = input_ids[k]
+                stop = min(j + len(end), n)
+                spans.append((start, stop))
                 i = stop
             else:
                 i += 1
+
+        if last_only and spans:
+            spans = spans[-1:]
+
+        for start, stop in spans:
+            for k in range(start, stop):
+                labels[k] = input_ids[k]
         return labels
 
     def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
@@ -597,11 +746,22 @@ class FaraCollator:
         texts: List[str] = []
         images_per_sample: List[List[Image.Image]] = []
         for ex in batch:
+            messages = ex["messages"]
+            images = ex["images"]
+
+            # Strategy A: sample a random decision point t per example.
+            if self.sampling_strategy == "decision_point":
+                # Number of assistant turns = (len(messages) - 1) // 2
+                n_turns = (len(messages) - 1) // 2
+                if n_turns > 0:
+                    t = self._rng.randrange(n_turns)
+                    messages, images = self._truncate_to_decision_point(messages, images, t)
+
             text = self.processor.apply_chat_template(
-                ex["messages"], tokenize=False, add_generation_prompt=False,
+                messages, tokenize=False, add_generation_prompt=False,
             )
             texts.append(text)
-            images_per_sample.append([_decode_image(img) for img in ex["images"]])
+            images_per_sample.append([_decode_image(img) for img in images])
 
         # Run the processor per-sample so image_grid_thw rows align with samples.
         # We will then concatenate pixel tensors across the batch (Qwen-VL style).
@@ -632,7 +792,8 @@ class FaraCollator:
             L = len(ids)
             input_ids[i, :L] = torch.tensor(ids, dtype=torch.long)
             attention_mask[i, :L] = 1
-            sample_labels = self._build_labels(ids)
+            # sample_labels = self._build_labels(ids, last_only=(self.sampling_strategy != "none"))
+            sample_labels = self._build_labels(ids, last_only=self.sampling_strategy in {"decision_point"})
             labels[i, :L] = torch.tensor(sample_labels, dtype=torch.long)
 
         out: Dict[str, torch.Tensor] = {
@@ -710,6 +871,16 @@ def parse_args() -> argparse.Namespace:
                    help="Disable multi-scale patching (single-scale path).")
     p.add_argument("--lora", action="store_true",
                    help="LoRA fine-tune instead of full fine-tune.")
+    p.add_argument("--sampling_strategy", default="decision_point",
+                   choices=["none", "decision_point"],
+                   help="How to sample within each trajectory at training time. "
+                        "'none' = train on the whole trajectory as-is. "
+                        "'decision_point' = Strategy A: sample one random step t "
+                        "per row, only train on the action at that step, with "
+                        "the last max_n_images_train screenshots kept in context.")
+    p.add_argument("--max_n_images_train", type=int, default=3,
+                   help="Image budget when sampling_strategy != 'none'. "
+                        "Mirrors FaraAgent.max_n_images at inference (default 3).")
     p.add_argument("--freeze_vision", action="store_true",
                    help="Freeze the vision tower (full FT only).")
     p.add_argument("--bf16", action="store_true", default=True)
@@ -836,6 +1007,20 @@ def build_dataset(args: argparse.Namespace, processor: Qwen2_5_VLProcessor):
         remove_columns=ds.column_names,
         num_proc=4,
     )
+
+    # Drop trajectories where any step had an unmapped action — `row_to_messages`
+    # signals these by returning {"messages": [], "images": []}.
+    before = len(ds)
+    ds = ds.filter(lambda x: len(x["messages"]) > 0, num_proc=4)
+    after = len(ds)
+    if before != after:
+        print(f"[fara-train] dropped {before - after}/{before} trajectories with unmapped actions; "
+              f"{after} remain")
+    if after == 0:
+        raise ValueError(
+            "All trajectories were dropped due to unmapped actions. "
+            "Check _format_assistant_message and the dataset's action vocabulary."
+        )
     return ds
 
 
@@ -858,6 +1043,8 @@ def main() -> None:
         processor=processor,
         max_seq_length=args.max_seq_length,
         use_multiscale=not args.no_multiscale,
+        sampling_strategy=args.sampling_strategy,
+        max_n_images=args.max_n_images_train,
     )
 
     fsdp_options: List[str] = []
