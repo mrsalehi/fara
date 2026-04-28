@@ -77,6 +77,30 @@ def _decode_image(img_entry: Any) -> Image.Image:
     return Image.open(io.BytesIO(raw)).convert("RGB")
 
 
+def _extract_instruction_text(raw: Any) -> str:
+    """MolmoWeb stores `instruction` as a JSON dict with high/mid/low_level keys.
+    Train on `high_level` only — closest to inference-time user phrasing; the
+    other levels leak the plan into the prompt.
+    """
+    if isinstance(raw, dict):
+        d = raw
+    elif isinstance(raw, str):
+        s = raw.strip()
+        try:
+            d = json.loads(s)
+        except (json.JSONDecodeError, ValueError):
+            return s
+        if not isinstance(d, dict):
+            return s
+    else:
+        return str(raw)
+    for key in ("high_level", "instruction", "task", "goal"):
+        v = d.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return json.dumps(d)
+
+
 def _is_blank_image_entry(img_entry: Any, max_var: float = 0.0) -> bool:
     """Return True if the image is perfectly uniform (variance == 0).
     PNG is lossless so a true about:blank viewport has exactly zero variance.
@@ -506,7 +530,7 @@ def row_to_messages(row: Dict[str, Any], system_prompt_text: Optional[str] = Non
         {"messages": [...], "images": [<raw image entries>]}
     """
     sample_id = row.get("sample_id")
-    instruction: str = str(row.get("instruction", ""))
+    instruction = _extract_instruction_text(row.get("instruction", ""))
     images_raw: List[Any] = row["images"]
     trajectory_raw = row.get("trajectory", [])
 
