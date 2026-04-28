@@ -316,8 +316,11 @@ def _format_assistant_message(step: Any) -> Optional[str]:
                or action_args.get("message")
                or action_args.get("text"))
         if isinstance(msg, str) and msg.strip():
+            # Strip MolmoWeb's [ANSWER] / [EXIT] / [FAILURE] bracket tags — they're
+            # bookkeeping markers, not part of the user-facing answer.
+            cleaned = re.sub(r"^\s*\[(?:ANSWER|EXIT|FAILURE)\]\s*", "", msg.strip())
             base = (thought or "").strip()
-            thought = (base + "\n\n" + msg.strip()).strip() if base else msg.strip()
+            thought = (base + "\n\n" + cleaned).strip() if base else cleaned
         action_name = "terminate"
         action_args = {}
 
