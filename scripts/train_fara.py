@@ -892,6 +892,14 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--report_to", default="none",
                    help="Logging backend(s): 'none', 'wandb', or comma-separated values accepted by Transformers.")
+    p.add_argument("--wandb_project", default="fara-sft",
+                   help="W&B project name. Used only when 'wandb' is in --report_to.")
+    p.add_argument("--wandb_run_name", default=None,
+                   help="W&B run name. Defaults to the basename of --output_dir.")
+    p.add_argument("--wandb_tags", default=None,
+                   help="Comma-separated W&B tags (e.g. 'lora,multiscale').")
+    p.add_argument("--wandb_entity", default=None,
+                   help="W&B entity (team/user). Falls back to default login if unset.")
 
     # Toggles
     p.add_argument("--no_multiscale", action="store_true",
@@ -1085,6 +1093,15 @@ def main() -> None:
     if len(report_to) == 0 or report_to == ["none"]:
         report_to = []
 
+    # W&B env vars are picked up by Transformers' WandbCallback at init time.
+    if "wandb" in report_to:
+        os.environ["WANDB_PROJECT"] = args.wandb_project
+        if args.wandb_entity:
+            os.environ["WANDB_ENTITY"] = args.wandb_entity
+        if args.wandb_tags:
+            os.environ["WANDB_TAGS"] = args.wandb_tags
+    run_name = args.wandb_run_name or os.path.basename(args.output_dir.rstrip("/"))
+
     train_args = SFTConfig(
         output_dir=args.output_dir,
         per_device_train_batch_size=args.per_device_batch_size,
@@ -1102,6 +1119,7 @@ def main() -> None:
         dataset_kwargs={"skip_prepare_dataset": True},
         max_length=args.max_seq_length,
         report_to=report_to,
+        run_name=run_name,
         save_total_limit=3,
         optim="adamw_torch",
         fsdp=fsdp_value,
