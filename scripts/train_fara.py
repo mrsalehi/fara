@@ -39,6 +39,9 @@ from transformers import Qwen2_5_VLProcessor
 from fara.modeling.modeling_qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
 from fara.modeling.image_processing_qwen2_vl import Qwen2VLImageProcessor
 from fara._prompts import get_computer_use_system_prompt
+from fara.training_utils import log, setup_logging
+
+setup_logging()
 
 
 # ---------------------------------------------------------------------------
@@ -482,7 +485,7 @@ def _validate_image_step_alignment(images: List[Any], steps: List[Any], sample_i
 
     if mode in {"strict", "error", "raise"}:
         raise ValueError(msg)
-    print(msg)
+    log(msg)
 
 
 def _get_step_url(step: Any) -> Optional[str]:
@@ -606,7 +609,7 @@ def row_to_messages(row: Dict[str, Any], system_prompt_text: Optional[str] = Non
         try:
             system_prompt_text = _build_system_prompt_for_image(images[0])
         except Exception as e:
-            print(f"[fara-train] failed to build production system prompt "
+            log(f"[fara-train] failed to build production system prompt "
                   f"(sample_id={sample_id}): {e}; falling back to generic.")
     if not system_prompt_text:
         system_prompt_text = (
@@ -793,15 +796,21 @@ class FaraCollator:
         # Run the processor per-sample so image_grid_thw rows align with samples.
         # We will then concatenate pixel tensors across the batch (Qwen-VL style).
         per_sample = []
-        for text, imgs in zip(texts, images_per_sample):
-            enc = self.processor(
-                text=[text],
-                images=imgs if imgs else None,
-                padding=False,
-                truncation=True,
-                max_length=self.max_seq_length,
-                return_tensors="pt",
-            )
+        ip = self.processor.image_processor
+        for (text, imgs), ex in zip(zip(texts, images_per_sample), batch):
+            # Stash collator context so _dump_empty_kept_case can write it.
+            ip._collator_debug_info = {"text": text, "messages": ex["messages"]}
+            try:
+                enc = self.processor(
+                    text=[text],
+                    images=imgs if imgs else None,
+                    padding=False,
+                    truncation=True,
+                    max_length=self.max_seq_length,
+                    return_tensors="pt",
+                )
+            finally:
+                ip._collator_debug_info = None
             per_sample.append(enc)
 
         # --- pad input_ids / attention_mask / build labels ---
@@ -989,7 +998,7 @@ def build_dataset(args: argparse.Namespace, processor: Qwen2_5_VLProcessor):
     allowed_domains = [d.strip().lower() for d in args.allowed_domains.split(",") if d.strip()]
     allowed_domains = [d[4:] if d.startswith("www.") else d for d in allowed_domains]
     if allowed_domains:
-        print(f"[fara-train] applying domain allowlist ({args.domain_filter_mode}): {allowed_domains}")
+        log(f"[fara-train] applying domain allowlist ({args.domain_filter_mode}): {allowed_domains}")
 
         def _keep_row(row: Dict[str, Any]) -> bool:
             domains = _extract_row_domains(row.get("trajectory"))
@@ -1005,7 +1014,7 @@ def build_dataset(args: argparse.Namespace, processor: Qwen2_5_VLProcessor):
         before = len(ds)
         ds = ds.filter(_keep_row, num_proc=4)
         after = len(ds)
-        print(f"[fara-train] domain filter kept {after}/{before} rows")
+        log(f"[fara-train] domain filter kept {after}/{before} rows")
 
         if after == 0:
             raise ValueError(
@@ -1049,7 +1058,7 @@ def build_dataset(args: argparse.Namespace, processor: Qwen2_5_VLProcessor):
     ds = ds.filter(lambda x: len(x["messages"]) > 0, num_proc=4)
     after = len(ds)
     if before != after:
-        print(f"[fara-train] dropped {before - after}/{before} trajectories with unmapped actions; "
+        log(f"[fara-train] dropped {before - after}/{before} trajectories with unmapped actions; "
               f"{after} remain")
     if after == 0:
         raise ValueError(
@@ -1065,14 +1074,14 @@ def main() -> None:
 
     from trl import SFTConfig, SFTTrainer
 
-    print(f"[fara-train] multi-scale = {not args.no_multiscale}")
-    print(f"[fara-train] LoRA        = {args.lora}")
+    log(f"[fara-train] multi-scale = {not args.no_multiscale}")
+    log(f"[fara-train] LoRA        = {args.lora}")
 
     processor, model = load_processor_and_model(args)
     model, lora_config = maybe_wrap_peft(model, args)
 
     dataset = build_dataset(args, processor)
-    print(f"[fara-train] dataset size = {len(dataset)}")
+    log(f"[fara-train] dataset size = {len(dataset)}")
 
     collator = FaraCollator(
         processor=processor,

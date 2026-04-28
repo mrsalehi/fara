@@ -505,6 +505,74 @@ class Qwen2VLImageProcessor(BaseImageProcessor):
             'trailing_dup_dropped': trailing_dup,
         }
 
+    def _dump_empty_kept_case(self, idx, current_image, images, traj_data):
+        """Dump the current frame + its predecessor + diff_frame visualization
+        when kept_patches is empty, so we can see what caused the failure.
+        Output dir: $FARA_EMPTY_KEPT_DUMP_DIR (default /tmp/fara_empty_kept).
+        """
+        import os, time
+        from PIL import Image as _PIL
+        from fara.modeling.trajectory_patch import visualize_frame
+
+        dump_dir = os.environ.get("FARA_EMPTY_KEPT_DUMP_DIR", "/tmp/fara_empty_kept")
+        os.makedirs(dump_dir, exist_ok=True)
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        run_dir = os.path.join(dump_dir, f"empty_kept_{ts}_pid{os.getpid()}_idx{idx}")
+        os.makedirs(run_dir, exist_ok=True)
+
+        def _to_pil(x):
+            if isinstance(x, _PIL.Image):
+                return x.convert("RGB")
+            arr = np.asarray(x)
+            if arr.dtype != np.uint8:
+                arr = np.clip(arr, 0, 255).astype(np.uint8)
+            if arr.ndim == 3 and arr.shape[0] in (1, 3) and arr.shape[-1] not in (1, 3):
+                arr = arr.transpose(1, 2, 0)
+            return _PIL.fromarray(arr)
+
+        try:
+            _to_pil(current_image).save(os.path.join(run_dir, "curr.png"))
+        except Exception as e:
+            print(f"[fara] failed to save curr.png: {e}")
+        if idx > 0:
+            try:
+                _to_pil(images[idx - 1]).save(os.path.join(run_dir, "prev.png"))
+            except Exception as e:
+                print(f"[fara] failed to save prev.png: {e}")
+
+        info = traj_data['per_frame'][idx]
+        try:
+            visualize_frame(
+                info['_img'], info['kept_patches'], info['dropped_patches'],
+                info['frame_idx'], info['scroll_dy'],
+                os.path.join(run_dir, "viz_kept_dropped.png"),
+            )
+        except Exception as e:
+            print(f"[fara] visualize_frame failed: {e}")
+
+        import json as _json
+        with open(os.path.join(run_dir, "info.txt"), "w") as f:
+            f.write(f"idx={idx}\n")
+            f.write(f"frame_idx={info.get('frame_idx')}\n")
+            f.write(f"scroll_dy={info.get('scroll_dy')}\n")
+            f.write(f"img_size={info.get('img_size')}\n")
+            f.write(f"kept_patches={len(info.get('kept_patches', []))}\n")
+            f.write(f"dropped_patches={len(info.get('dropped_patches', []))}\n")
+            f.write(f"n_total_frames={len(traj_data['per_frame'])}\n")
+
+        # Dump collator-level context (chat text + messages) if the collator
+        # set self._collator_debug_info before calling preprocess.
+        debug = getattr(self, "_collator_debug_info", None)
+        if debug:
+            if "text" in debug:
+                with open(os.path.join(run_dir, "chat_text.txt"), "w") as f:
+                    f.write(debug["text"])
+            if "messages" in debug:
+                with open(os.path.join(run_dir, "messages.json"), "w") as f:
+                    _json.dump(debug["messages"], f, indent=2, default=str)
+
+        print(f"[fara] empty kept_patches at idx={idx}; dumped to {run_dir}", flush=True)
+
     def _maybe_visualize_trajectory(self, traj_data):
         import os
         viz_dir = os.environ.get("FARA_TRAJ_VIZ_DIR")
@@ -675,6 +743,14 @@ class Qwen2VLImageProcessor(BaseImageProcessor):
             all_positions, all_centers = [], []
             for idx, image in enumerate(images):
                 per_frame = [traj_data['per_frame'][idx]] if traj_data is not None else None
+
+                # Debug: if multiscale diff produced zero kept patches for this
+                # frame, _preprocess will crash on np.concatenate(empty list).
+                # Dump the offending frame + its predecessor + the kept/dropped
+                # visualization so we can inspect what diff_frame saw.
+                if per_frame is not None and len(per_frame[0].get('kept_patches', [])) == 0:
+                    self._dump_empty_kept_case(idx, image, images, traj_data)
+
                 patches, image_grid_thw, pos_ms, ctr_ms = self._preprocess(
                     image,
                     do_resize=do_resize,
