@@ -3,7 +3,7 @@
 #SBATCH --gres=gpu:h200:4
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=256G
-#SBATCH --time=12:00:00
+#SBATCH --time=24:00:00
 #SBATCH --chdir=/gpfs/projects/raivn/reza/fara
 #SBATCH --output=/gpfs/projects/raivn/reza/fara/logs/slurm-%x-%j.out
 #SBATCH --error=/gpfs/projects/raivn/reza/fara/logs/slurm-%x-%j.out
@@ -44,6 +44,10 @@ REPO_ROOT=/gpfs/projects/raivn/reza/fara/
 : "${OUTPUT_DIR:=$REPO_ROOT/results/fara_sft_2k_${SLURM_JOB_ID:-local}}"
 : "${WANDB_RUN_NAME:=fara-sft-2k-lora-${SLURM_JOB_ID:-local}}"
 
+# LoRA toggle: LORA=1 (default) for LoRA fine-tune, LORA=0 for full FT.
+LORA_FLAG=""
+[[ "${LORA:-1}" == "1" ]] && LORA_FLAG="--lora"
+
 export HF_TOKEN="${HF_TOKEN:-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}"
 export TOKENIZERS_PARALLELISM=false
 
@@ -62,16 +66,16 @@ accelerate launch \
     --per_device_batch_size 1 \
     --gradient_accumulation_steps 8 \
     --learning_rate 1e-5 \
-    --num_epochs 1 \
+    --num_epochs ${EPOCHS:-1} \
     --max_seq_length 8192 \
     --logging_steps 1 \
     --save_steps 200 \
-    --max_samples 2000 \
+    --max_samples ${MAX_SAMPLES:-2000} \
     --bf16 \
     --gradient_checkpointing \
     --attn_implementation sdpa \
     --allowed_domains arxiv.org,allrecipes.com \
-    --lora \
+    ${LORA_FLAG} \
     --report_to wandb \
     --wandb_entity mrsalehi \
     --wandb_project fara-multiscale \
