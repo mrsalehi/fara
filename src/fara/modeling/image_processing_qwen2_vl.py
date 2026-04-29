@@ -477,13 +477,7 @@ class Qwen2VLImageProcessor(BaseImageProcessor):
             traj_frames, var_thresh=var_thresh, mse_thresh=mse_thresh,
         )
 
-        def _group_by_size(patches):
-            if len(patches) == 0:
-                return {}
-            arr = np.asarray(patches, dtype=np.int32)
-            sizes = arr[:, 2]
-
-            return {int(s): arr[sizes == s, :2] for s in np.unique(sizes)}
+        from fara.modeling.trajectory_patch import group_patches_by_size as _group_by_size
 
         per_frame = [
             {

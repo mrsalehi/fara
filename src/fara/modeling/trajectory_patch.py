@@ -142,6 +142,17 @@ def compute_variance(arr, x, y, size):
     return float(np.var(patch.astype(np.float32)))
 
 
+def group_patches_by_size(patches):
+    """Group a list of (x, y, size) patch tuples into {size: coords_array}.
+    Used by both _compute_trajectory_patches and per_sample_transform.
+    """
+    if not patches:
+        return {}
+    arr = np.asarray(patches, dtype=np.int32)
+    sizes = arr[:, 2]
+    return {int(s): arr[sizes == s, :2] for s in np.unique(sizes)}
+
+
 def quadtree_decompose(arr, x, y, size, var_thresh):
     h, w = arr.shape[:2]
     if min(size, w - x) <= 0 or min(size, h - y) <= 0:
@@ -331,6 +342,15 @@ def process_trajectory(images, var_thresh=100.0, mse_thresh=10.0):
 
             # Hierarchical diff against scroll-aligned previous frame
             kept, dropped = diff_frame(arr, prev_aligned, mse_thresh, var_thresh)
+
+            # If the frame is fully redundant (e.g. action didn't visually change
+            # the page below the MSE threshold), promote the coarsest dropped patch
+            # so downstream processors always have at least one patch to encode.
+            if not kept and dropped:
+                arr_d = np.asarray(dropped, dtype=np.int32)
+                biggest = int(np.argmax(arr_d[:, 2]))
+                kept    = [tuple(arr_d[biggest].tolist())]
+                dropped = [d for j, d in enumerate(dropped) if j != biggest]
 
             results.append({
                 'frame_idx': orig_idx,

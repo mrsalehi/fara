@@ -22,6 +22,7 @@ import argparse
 import io
 import json
 import os
+import random
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -35,6 +36,7 @@ import torch
 from datasets import load_dataset
 from PIL import Image
 from transformers import Qwen2_5_VLProcessor
+from fara.modeling.processing_qwen2_5_vl import FaraProcessor
 
 from fara.modeling.modeling_qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
 from fara.modeling.image_processing_qwen2_vl import Qwen2VLImageProcessor
@@ -55,7 +57,6 @@ MLM_PROCESSOR_IM_CFG = {
     "merge_size": 2,
 }
 USER_MESSAGE = "Here is the next screenshot. Think about what to do next."
-USER_MESSAGE_REDUNDANT = "The screenshot is unchanged from the previous step. Think about what to do next."
 FN_CALL_TEMPLATE_NAME = "default"
 TOOL_NAME = "computer_use"   # the only function registered in fara's <tools> block
 MAX_URL_LENGTH = 100         # mirrors FaraAgent.MAX_URL_LENGTH
@@ -102,6 +103,83 @@ def _extract_instruction_text(raw: Any) -> str:
         if isinstance(v, str) and v.strip():
             return v.strip()
     return json.dumps(d)
+
+
+def _truncate_to_decision_point(
+    messages: List[Dict[str, Any]],
+    images: List[Any],
+    t: int,
+    max_n_images: int,
+) -> tuple:
+    """Slice the trajectory to end at assistant turn `t`, keeping images
+    only for user turns in [t - max_n_images + 1, t]. Older user turns
+    keep their text but lose their image placeholder.
+    """
+    end_idx = 2 * t + 3
+    truncated = messages[:end_idx]
+    keep_image_start = max(0, t - max_n_images + 1)
+
+    new_messages: List[Dict[str, Any]] = []
+    new_images: List[Any] = []
+    user_turn_idx = 0
+    img_idx = 0
+    for msg in truncated:
+        if msg["role"] == "user":
+            has_image = any(isinstance(c, dict) and c.get("type") == "image"
+                            for c in msg["content"])
+            if user_turn_idx >= keep_image_start:
+                new_messages.append(msg)
+                if has_image:
+                    new_images.append(images[img_idx])
+            else:
+                text_only = [c for c in msg["content"]
+                             if not (isinstance(c, dict) and c.get("type") == "image")]
+                new_messages.append({"role": "user", "content": text_only})
+            if has_image:
+                img_idx += 1
+            user_turn_idx += 1
+        else:
+            new_messages.append(msg)
+
+    return new_messages, new_images
+
+
+def _build_labels(
+    input_ids: List[int],
+    assistant_header_ids: List[int],
+    turn_end_ids: List[int],
+    last_only: bool = False,
+) -> List[int]:
+    """Mask all tokens except assistant completions (-100). If `last_only`,
+    unmask only the final assistant span (decision-point training).
+    """
+    labels = [-100] * len(input_ids)
+    n = len(input_ids)
+    hdr, end = assistant_header_ids, turn_end_ids
+
+    spans = []
+    i = 0
+    while i <= n - len(hdr):
+        if input_ids[i : i + len(hdr)] == hdr:
+            start = i + len(hdr)
+            j = start
+            while j <= n - len(end):
+                if input_ids[j : j + len(end)] == end:
+                    break
+                j += 1
+            stop = min(j + len(end), n)
+            spans.append((start, stop))
+            i = stop
+        else:
+            i += 1
+
+    if last_only and spans:
+        spans = spans[-1:]
+
+    for start, stop in spans:
+        for k in range(start, stop):
+            labels[k] = input_ids[k]
+    return labels
 
 
 def _is_blank_image_entry(img_entry: Any, max_var: float = 0.0) -> bool:
@@ -553,58 +631,6 @@ def row_to_messages(row: Dict[str, Any], system_prompt_text: Optional[str] = Non
     # Optional sanity check for datasets that provide image path + step screenshot keys.
     _validate_image_step_alignment(images, steps, sample_id=sample_id)
 
-    # Decode all images once and reuse across the three pixel-level checks
-    # below (leading-blank, trailing-dup, mid-trajectory-dup).
-    arrays: List[Optional[np.ndarray]] = []
-    for img in images:
-        try:
-            arrays.append(np.asarray(_decode_image(img), dtype=np.uint8))
-        except Exception:
-            arrays.append(None)
-
-    def _arrs_equal(a: Optional[np.ndarray], b: Optional[np.ndarray]) -> bool:
-        return (a is not None and b is not None
-                and a.shape == b.shape and np.array_equal(a, b))
-
-    # 1) Leading blank prefix (variance == 0 -> about:blank). Drop their pixels;
-    # keep step[0] as the "task -> first action" signal but drop any later
-    # pre-render steps since their actions weren't informed by anything visible.
-    n_leading_blank = 0
-    while (n_leading_blank < len(arrays) and arrays[n_leading_blank] is not None
-           and float(arrays[n_leading_blank].astype(np.float32).var()) == 0.0):
-        n_leading_blank += 1
-    images = images[n_leading_blank:]
-    arrays = arrays[n_leading_blank:]
-    if n_leading_blank > 1:
-        steps = [steps[0]] + steps[n_leading_blank:]
-
-    # 2) Trailing duplicate: redundant terminal observation (e.g. [EXIT] ping
-    # after the answer was already sent). Drop image AND step.
-    if len(arrays) >= 2 and len(steps) >= 2 and _arrs_equal(arrays[-1], arrays[-2]):
-        images = images[:-1]
-        arrays = arrays[:-1]
-        steps  = steps[:-1]
-
-    # 3) Mid-trajectory duplicate: this frame is pixel-identical to the previous
-    # one (the action didn't visually change the page). Drop the image, keep
-    # the step; the user-turn text gets a marker so the model knows there was
-    # a screenshot but it's unchanged.
-    n_steps = len(steps)
-    step_has_image = [True] * n_steps
-    if n_leading_blank > 0 and n_steps > 0:
-        step_has_image[0] = False   # leading-blank task turn
-
-    new_images: List[Any] = []
-    prev_arr: Optional[np.ndarray] = None
-    for img_idx, arr in enumerate(arrays):
-        step_idx = img_idx + (1 if n_leading_blank > 0 else 0)
-        if _arrs_equal(prev_arr, arr) and step_idx < n_steps:
-            step_has_image[step_idx] = False
-        else:
-            new_images.append(images[img_idx])
-        prev_arr = arr
-    images = new_images
-
     if system_prompt_text is None and images:
         try:
             system_prompt_text = _build_system_prompt_for_image(images[0])
@@ -632,19 +658,17 @@ def row_to_messages(row: Dict[str, Any], system_prompt_text: Optional[str] = Non
          "content": [{"type": "text", "text": system_prompt_text}]},
     ]
     for i, (step, assistant_text) in enumerate(zip(steps, formatted_steps)):
-        has_image = step_has_image[i]
         if i == 0:
             user_text = instruction
         else:
             url = _get_step_url(step)
             url_prefix = f"Current URL: {_trim_url(url)}\n" if url else ""
-            suffix = USER_MESSAGE if has_image else USER_MESSAGE_REDUNDANT
-            user_text = f"{url_prefix}{suffix}"
+            user_text = f"{url_prefix}{USER_MESSAGE}"
 
-        user_content: List[Dict[str, Any]] = [{"type": "text", "text": user_text}]
-        if has_image:
-            user_content.insert(0, {"type": "image"})
-        messages.append({"role": "user", "content": user_content})
+        messages.append({
+            "role": "user",
+            "content": [{"type": "image"}, {"type": "text", "text": user_text}],
+        })
         messages.append({
             "role": "assistant",
             "content": [{"type": "text", "text": assistant_text}],
@@ -666,192 +690,117 @@ def _extract_system_prompt_text(prompt_info: Dict[str, Any]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Collator: builds input_ids, labels with assistant-only masking, and batches
-# the variable-length vision tensors (pixel_values, grid_thw, multi-scale).
+# Dataset: per-sample processing (decoding, trajectory diff, tokenization)
+# Collator: pad + stack only
 # ---------------------------------------------------------------------------
 
 ASSISTANT_HEADER = "<|im_start|>assistant\n"
 TURN_END = "<|im_end|>"
 
 
-@dataclass
-class FaraCollator:
-    processor: Any
-    max_seq_length: int = 8192
-    use_multiscale: bool = True
-    sampling_strategy: str = "decision_point"    # decision_point: sample one t per row
-    max_n_images: int = 3                  # mirror FaraAgent.max_n_images at runtime
+class FaraDataset(torch.utils.data.Dataset):
+    """Per-sample processing runs here (in DataLoader workers).
+    Returns fully tokenized tensors so the collator only pads/stacks.
+    """
 
-    def __post_init__(self) -> None:
-        import random as _random   # local import to avoid global pollution
-        self._rng = _random.Random()
-        tok = self.processor.tokenizer
-        # Pre-tokenize the assistant header so we can locate it in input_ids.
-        # Qwen uses `<|im_start|>`, `assistant`, `\n` as separate or combined
-        # tokens depending on version; tokenize both the header and `<|im_end|>`
-        # without special tokens, then pattern-match.
-        self._assistant_header_ids = tok.encode(ASSISTANT_HEADER, add_special_tokens=False)
-        self._turn_end_ids = tok.encode(TURN_END, add_special_tokens=False)
-        self.processor.image_processor.use_multiscale = self.use_multiscale
-
-    def _truncate_to_decision_point(
+    def __init__(
         self,
-        messages: List[Dict[str, Any]],
-        images: List[Any],
-        t: int,
-    ) -> tuple:
-        """Slice the trajectory to end at assistant turn `t`, keeping images
-        only for user turns in [t - max_n_images + 1, t]. Older user turns
-        keep their text but lose their image placeholder.
-        """
-        # Layout: [system, user_0, assistant_0, user_1, assistant_1, ...]
-        # assistant_t is at index 2t + 2; slice end-exclusive at 2t + 3.
-        end_idx = 2 * t + 3
-        truncated = messages[:end_idx]
+        hf_dataset: Any,
+        processor: Any,
+        use_multiscale: bool = True,
+        sampling_strategy: str = "decision_point",
+        max_n_images: int = 3,
+        max_seq_length: int = 8192,
+    ) -> None:
+        self.hf_dataset = hf_dataset
+        self.processor = processor
+        self.use_multiscale = use_multiscale
+        self.sampling_strategy = sampling_strategy
+        self.max_n_images = max_n_images
+        self.max_seq_length = max_seq_length
 
-        keep_image_start = max(0, t - self.max_n_images + 1)
+        processor.image_processor.use_multiscale = use_multiscale
+        tok = processor.tokenizer
+        self._header_ids = tok.encode(ASSISTANT_HEADER, add_special_tokens=False)
+        self._end_ids = tok.encode(TURN_END, add_special_tokens=False)
 
-        new_messages: List[Dict[str, Any]] = []
-        new_images: List[Any] = []
-        user_turn_idx = 0
-        img_idx = 0   # advances only on user turns that carry an image placeholder
-        for msg in truncated:
-            if msg["role"] == "user":
-                has_image = any(isinstance(c, dict) and c.get("type") == "image"
-                                for c in msg["content"])
-                if user_turn_idx >= keep_image_start:
-                    new_messages.append(msg)
-                    if has_image:
-                        new_images.append(images[img_idx])
-                else:
-                    text_only = [c for c in msg["content"]
-                                 if not (isinstance(c, dict) and c.get("type") == "image")]
-                    new_messages.append({"role": "user", "content": text_only})
-                if has_image:
-                    img_idx += 1
-                user_turn_idx += 1
-            else:
-                new_messages.append(msg)
+    def __len__(self) -> int:
+        return len(self.hf_dataset)
 
-        return new_messages, new_images
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        row = self.hf_dataset[idx]
+        messages = row["messages"]
+        pil_images = [_decode_image(img) for img in row["images"]]
 
-    def _build_labels(self, input_ids: List[int], last_only: bool = False) -> List[int]:
-        """Mask everything except assistant completions.
-
-        If `last_only=True`, only the FINAL assistant span is unmasked — used
-        with Strategy A so we only train on the prediction at the sampled
-        decision point (earlier assistant turns are context, not targets).
-        """
-        labels = [-100] * len(input_ids)
-        n = len(input_ids)
-        hdr = self._assistant_header_ids
-        end = self._turn_end_ids
-
-        spans = []   # list of (start, stop) for each assistant span
-        i = 0
-        while i <= n - len(hdr):
-            if input_ids[i : i + len(hdr)] == hdr:
-                start = i + len(hdr)
-                j = start
-                while j <= n - len(end):
-                    if input_ids[j : j + len(end)] == end:
-                        break
-                    j += 1
-                stop = min(j + len(end), n)
-                spans.append((start, stop))
-                i = stop
-            else:
-                i += 1
-
-        if last_only and spans:
-            spans = spans[-1:]
-
-        for start, stop in spans:
-            for k in range(start, stop):
-                labels[k] = input_ids[k]
-        return labels
-
-    def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-        tok = self.processor.tokenizer
-        texts: List[str] = []
-        images_per_sample: List[List[Image.Image]] = []
-        for ex in batch:
-            messages = ex["messages"]
-            images = ex["images"]
-
-            # Strategy A: sample a random decision point t per example.
-            if self.sampling_strategy == "decision_point":
-                # Number of assistant turns = (len(messages) - 1) // 2
-                n_turns = (len(messages) - 1) // 2
-                if n_turns > 0:
-                    t = self._rng.randrange(n_turns)
-                    messages, images = self._truncate_to_decision_point(messages, images, t)
-
-            text = self.processor.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=False,
-            )
-            texts.append(text)
-            images_per_sample.append([_decode_image(img) for img in images])
-
-        # Run the processor per-sample so image_grid_thw rows align with samples.
-        # We will then concatenate pixel tensors across the batch (Qwen-VL style).
-        per_sample = []
-        ip = self.processor.image_processor
-        for (text, imgs), ex in zip(zip(texts, images_per_sample), batch):
-            # Stash collator context so _dump_empty_kept_case can write it.
-            ip._collator_debug_info = {"text": text, "messages": ex["messages"]}
-            try:
-                enc = self.processor(
-                    text=[text],
-                    images=imgs if imgs else None,
-                    padding=False,
-                    truncation=True,
-                    max_length=self.max_seq_length,
-                    return_tensors="pt",
+        if self.sampling_strategy == "decision_point":
+            n_turns = (len(messages) - 1) // 2
+            if n_turns > 0:
+                t = random.randrange(n_turns)
+                messages, pil_images = _truncate_to_decision_point(
+                    messages, pil_images, t, max_n_images=self.max_n_images,
                 )
-            finally:
-                ip._collator_debug_info = None
-            per_sample.append(enc)
 
-        # --- pad input_ids / attention_mask / build labels ---
-        pad_id = tok.pad_token_id
-        if pad_id is None:
-            pad_id = tok.eos_token_id
+        enc = self.processor(
+            messages=messages,
+            images=pil_images,
+            padding=False,
+            truncation=True,
+            max_length=self.max_seq_length,
+            return_tensors="pt",
+        )
 
-        max_len = max(enc["input_ids"].shape[1] for enc in per_sample)
-        input_ids = torch.full((len(per_sample), max_len), pad_id, dtype=torch.long)
-        attention_mask = torch.zeros_like(input_ids)
-        labels = torch.full_like(input_ids, -100)
-
-        for i, enc in enumerate(per_sample):
-            ids = enc["input_ids"][0].tolist()
-            L = len(ids)
-            input_ids[i, :L] = torch.tensor(ids, dtype=torch.long)
-            attention_mask[i, :L] = 1
-            # sample_labels = self._build_labels(ids, last_only=(self.sampling_strategy != "none"))
-            sample_labels = self._build_labels(ids, last_only=self.sampling_strategy in {"decision_point"})
-            labels[i, :L] = torch.tensor(sample_labels, dtype=torch.long)
+        ids = enc["input_ids"][0].tolist()
+        labels = _build_labels(
+            ids, self._header_ids, self._end_ids,
+            last_only=(self.sampling_strategy == "decision_point"),
+        )
 
         out: Dict[str, torch.Tensor] = {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "labels": labels,
+            "input_ids":      enc["input_ids"][0],
+            "attention_mask": enc["attention_mask"][0],
+            "labels":         torch.tensor(labels, dtype=torch.long),
+        }
+        if "pixel_values" in enc:
+            out["pixel_values"]   = enc["pixel_values"]
+            out["image_grid_thw"] = enc["image_grid_thw"]
+        if "maybe_positions_multiscale" in enc:
+            out["maybe_positions_multiscale"] = enc["maybe_positions_multiscale"]
+            out["maybe_centers_multiscale"]   = enc["maybe_centers_multiscale"]
+        return out
+
+
+@dataclass
+class FaraCollator:
+    """Pad variable-length sequences and concatenate vision tensors into a batch.
+    All heavy processing (decoding, trajectory diff, tokenization) happens in
+    FaraDataset.__getitem__ (DataLoader workers).
+    """
+    pad_id: int
+
+    def __call__(self, batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+        max_len = max(ex["input_ids"].shape[0] for ex in batch)
+        B = len(batch)
+
+        input_ids     = torch.full((B, max_len), self.pad_id, dtype=torch.long)
+        attention_mask = torch.zeros(B, max_len, dtype=torch.long)
+        labels        = torch.full((B, max_len), -100, dtype=torch.long)
+
+        for i, ex in enumerate(batch):
+            L = ex["input_ids"].shape[0]
+            input_ids[i, :L]      = ex["input_ids"]
+            attention_mask[i, :L] = 1
+            labels[i, :L]         = ex["labels"]
+
+        out: Dict[str, torch.Tensor] = {
+            "input_ids": input_ids, "attention_mask": attention_mask, "labels": labels,
         }
 
-        # --- concat vision tensors across the batch ---
-        if any("pixel_values" in e for e in per_sample):
-            pvs = [e["pixel_values"] for e in per_sample if "pixel_values" in e]
-            grids = [e["image_grid_thw"] for e in per_sample if "image_grid_thw" in e]
-            out["pixel_values"] = torch.cat(pvs, dim=0)
-            out["image_grid_thw"] = torch.cat(grids, dim=0)
-
-            if self.use_multiscale and "maybe_positions_multiscale" in per_sample[0]:
-                mp = [e["maybe_positions_multiscale"] for e in per_sample
-                      if "maybe_positions_multiscale" in e]
-                mc = [e["maybe_centers_multiscale"] for e in per_sample
-                      if "maybe_centers_multiscale" in e]
-                out["maybe_positions_multiscale"] = torch.cat(mp, dim=0)
-                out["maybe_centers_multiscale"] = torch.cat(mc, dim=0)
+        if any("pixel_values" in ex for ex in batch):
+            out["pixel_values"]   = torch.cat([ex["pixel_values"]   for ex in batch if "pixel_values"   in ex])
+            out["image_grid_thw"] = torch.cat([ex["image_grid_thw"] for ex in batch if "image_grid_thw" in ex])
+            if any("maybe_positions_multiscale" in ex for ex in batch):
+                out["maybe_positions_multiscale"] = torch.cat([ex["maybe_positions_multiscale"] for ex in batch if "maybe_positions_multiscale" in ex])
+                out["maybe_centers_multiscale"]   = torch.cat([ex["maybe_centers_multiscale"]   for ex in batch if "maybe_centers_multiscale"   in ex])
 
         return out
 
@@ -950,7 +899,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def load_processor_and_model(args: argparse.Namespace):
-    processor = Qwen2_5_VLProcessor.from_pretrained(args.model_id)
+    processor = FaraProcessor.from_pretrained(args.model_id)
     processor.image_processor = Qwen2VLImageProcessor.from_pretrained(args.model_id)
     processor.image_processor.use_multiscale = not args.no_multiscale
 
@@ -1065,6 +1014,7 @@ def build_dataset(args: argparse.Namespace, processor: Qwen2_5_VLProcessor):
             "All trajectories were dropped due to unmapped actions. "
             "Check _format_assistant_message and the dataset's action vocabulary."
         )
+
     return ds
 
 
@@ -1080,16 +1030,21 @@ def main() -> None:
     processor, model = load_processor_and_model(args)
     model, lora_config = maybe_wrap_peft(model, args)
 
-    dataset = build_dataset(args, processor)
-    log(f"[fara-train] dataset size = {len(dataset)}")
+    hf_dataset = build_dataset(args, processor)
+    log(f"[fara-train] dataset size = {len(hf_dataset)}")
 
-    collator = FaraCollator(
+    train_dataset = FaraDataset(
+        hf_dataset=hf_dataset,
         processor=processor,
-        max_seq_length=args.max_seq_length,
         use_multiscale=not args.no_multiscale,
         sampling_strategy=args.sampling_strategy,
         max_n_images=args.max_n_images_train,
+        max_seq_length=args.max_seq_length,
     )
+
+    tok = processor.tokenizer
+    pad_id = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
+    collator = FaraCollator(pad_id=pad_id)
 
     fsdp_options: List[str] = []
     if args.fsdp:
@@ -1138,7 +1093,7 @@ def main() -> None:
     trainer = SFTTrainer(
         model=model,
         args=train_args,
-        train_dataset=dataset,
+        train_dataset=train_dataset,
         data_collator=collator,
         processing_class=processor,
         peft_config=lora_config,
