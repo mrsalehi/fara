@@ -300,24 +300,18 @@ def process_trajectory(images, var_thresh=100.0, mse_thresh=10.0):
         img = load_frame(item)
         frames.append((img, np.array(img)))
 
-    # NOTE: leading-blank skip and trailing-dup drop are handled upstream in
-    # the dataset adapter (row_to_messages). Doing it here too would risk
-    # cascading drops that desync `per_frame` from the caller's image list.
-    n_skipped_blank = 0
-    trailing_dup_dropped = False
     active_frames = frames
 
     results = []
     prev_arr = None
 
-    for rel_i, (img, arr) in enumerate(active_frames):
-        orig_idx = n_skipped_blank + rel_i
+    for idx, (img, arr) in enumerate(active_frames):
 
         if prev_arr is None:
             # Frame 0: intra-frame quadtree
             all_patches = decompose_frame(arr, var_thresh)
             results.append({
-                'frame_idx': orig_idx,
+                'frame_idx': idx,
                 'kept_patches': all_patches,
                 'dropped_patches': [],
                 'img_size': img.size,
@@ -340,20 +334,13 @@ def process_trajectory(images, var_thresh=100.0, mse_thresh=10.0):
             else:
                 prev_aligned = prev_shifted
 
-            # Hierarchical diff against scroll-aligned previous frame
+            # Hierarchical diff against scroll-aligned previous frame.
+            # Empty `kept` means the frame is fully redundant vs. the previous;
+            # downstream code uses that signal to skip it.
             kept, dropped = diff_frame(arr, prev_aligned, mse_thresh, var_thresh)
 
-            # If the frame is fully redundant (e.g. action didn't visually change
-            # the page below the MSE threshold), promote the coarsest dropped patch
-            # so downstream processors always have at least one patch to encode.
-            if not kept and dropped:
-                arr_d = np.asarray(dropped, dtype=np.int32)
-                biggest = int(np.argmax(arr_d[:, 2]))
-                kept    = [tuple(arr_d[biggest].tolist())]
-                dropped = [d for j, d in enumerate(dropped) if j != biggest]
-
             results.append({
-                'frame_idx': orig_idx,
+                'frame_idx': idx,
                 'kept_patches': kept,
                 'dropped_patches': dropped,
                 'img_size': img.size,
@@ -363,7 +350,7 @@ def process_trajectory(images, var_thresh=100.0, mse_thresh=10.0):
 
         prev_arr = arr
 
-    return results, n_skipped_blank, trailing_dup_dropped
+    return results
 
 
 # ---------------------------------------------------------------------------

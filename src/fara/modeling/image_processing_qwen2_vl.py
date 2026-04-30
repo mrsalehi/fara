@@ -473,12 +473,14 @@ class Qwen2VLImageProcessor(BaseImageProcessor):
                 f = np.clip(f, 0, 255).astype(np.uint8)
             traj_frames.append(f)
 
-        traj_results, n_skipped, trailing_dup = process_trajectory(
+        traj_results = process_trajectory(
             traj_frames, var_thresh=var_thresh, mse_thresh=mse_thresh,
         )
 
         from fara.modeling.trajectory_patch import group_patches_by_size as _group_by_size
 
+        # One per_frame entry per input frame; `kept_patches == []` indicates a
+        # fully-redundant frame (caller decides whether/how to drop it).
         per_frame = [
             {
                 'frame_idx':       r['frame_idx'],
@@ -495,9 +497,50 @@ class Qwen2VLImageProcessor(BaseImageProcessor):
         return {
             'frames': traj_frames,
             'per_frame': per_frame,
-            'n_skipped_blank': n_skipped,
-            'trailing_dup_dropped': trailing_dup,
+            # 'n_skipped_blank': n_skipped,
+            # 'trailing_dup_dropped': trailing_dup,
         }
+
+    def _compute_image_status(self, traj_data, images) -> list:
+        """Per-input-image status used to keep messages and pixel_values aligned.
+
+        Decides between: 'active', 'blank_first', 'blank_drop', 'mid_dup',
+        'trailing_dup'. Multiscale uses kept_patches from process_trajectory
+        for mid_dup detection; single-scale only flags blank/trailing.
+        """
+        if traj_data is not None:
+            frames = traj_data['frames']
+            per_frame = traj_data['per_frame']
+        else:
+            frames = [np.asarray(convert_to_rgb(img) if hasattr(img, 'convert') else img,
+                                 dtype=np.uint8) for img in images]
+            per_frame = None
+
+        status: list = []
+        in_blank_prefix = True
+        for i, frame in enumerate(frames):
+            is_blank = float(frame.astype(np.float32).var()) == 0.0
+            kept_empty = (
+                per_frame is not None
+                and len(per_frame[i].get('kept_patches', [])) == 0
+            )
+
+            if is_blank and in_blank_prefix:
+                status.append('blank_first' if i == 0 else 'blank_drop')
+            elif kept_empty:
+                in_blank_prefix = False
+                status.append('mid_dup')
+            else:
+                in_blank_prefix = False
+                status.append('active')
+
+        # Trailing dup: last frame pixel-identical to the penultimate.
+        if (len(frames) >= 2
+                and status[-1] == 'active'
+                and frames[-1].shape == frames[-2].shape
+                and np.array_equal(frames[-1], frames[-2])):
+            status[-1] = 'trailing_dup'
+        return status
 
     def _dump_empty_kept_case(self, idx, current_image, images, traj_data):
         """Dump the current frame + its predecessor + diff_frame visualization
@@ -733,18 +776,26 @@ class Qwen2VLImageProcessor(BaseImageProcessor):
             else:
                 traj_data = None
             self._maybe_visualize_trajectory(traj_data)
+
+            # Decide a per-input-image status the parent processor can use to
+            # update messages in sync with the filtered image set:
+            #   "active"        — visual content kept, included in pixel_values/grid_thw
+            #   "blank_first"   — leading blank, idx 0; user_0 keeps task text, drops image
+            #   "blank_drop"    — leading blank, idx >= 1; drop user+assistant pair
+            #   "mid_dup"       — fully redundant frame (kept=[]); drop image, replace text
+            #   "trailing_dup"  — last frame identical to penult; drop user+assistant pair
+            image_status: list = self._compute_image_status(traj_data, images)
+
             pixel_values, vision_grid_thws = [], []
             all_positions, all_centers = [], []
+            active_pf_idx = 0
             for idx, image in enumerate(images):
-                per_frame = [traj_data['per_frame'][idx]] if traj_data is not None else None
-
-                # Debug: if multiscale diff produced zero kept patches for this
-                # frame, _preprocess will crash on np.concatenate(empty list).
-                # Dump the offending frame + its predecessor + the kept/dropped
-                # visualization so we can inspect what diff_frame saw.
-                if per_frame is not None and len(per_frame[0].get('kept_patches', [])) == 0:
-                    self._dump_empty_kept_case(idx, image, images, traj_data)
-
+                if image_status[idx] != 'active':
+                    continue
+                per_frame = (
+                    [traj_data['per_frame'][idx]] if traj_data is not None else None
+                )
+                active_pf_idx += 1
                 patches, image_grid_thw, pos_ms, ctr_ms = self._preprocess(
                     image,
                     do_resize=do_resize,
@@ -768,16 +819,18 @@ class Qwen2VLImageProcessor(BaseImageProcessor):
                 if pos_ms is not None:
                     all_positions.append(pos_ms)
                     all_centers.append(ctr_ms)
-            pixel_values = np.array(pixel_values)
-            vision_grid_thws = np.array(vision_grid_thws)
-            data.update({
-                "pixel_values": pixel_values,
-                "image_grid_thw": vision_grid_thws,
-            })
+
+            # data["image_status"] = image_status
+            if pixel_values:
+                data["pixel_values"]   = np.array(pixel_values)
+                data["image_grid_thw"] = np.array(vision_grid_thws)
             if all_positions:
                 data["maybe_positions_multiscale"] = np.concatenate(all_positions, axis=0)
             if all_centers:
                 data["maybe_centers_multiscale"] = np.concatenate(all_centers, axis=0)
+
+        # Extract image_status before creating BatchFeature (strings can't be tensorized)
+        # image_status_list = data.pop("image_status", None)
 
         # kept for BC only and should be removed after v5.0
         if videos is not None:
@@ -815,7 +868,13 @@ class Qwen2VLImageProcessor(BaseImageProcessor):
                 }
             )
 
-        return BatchFeature(data=data, tensor_type=return_tensors)
+        result = BatchFeature(data=data, tensor_type=return_tensors)
+        
+        # Add image_status back (not tensorized, stored as-is)
+        if image_status is not None:
+            result["image_status"] = image_status
+        
+        return result
 
     def get_number_of_image_patches(self, height: int, width: int, images_kwargs=None):
         """

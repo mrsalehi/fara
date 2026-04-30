@@ -713,7 +713,7 @@ class FaraDataset(torch.utils.data.Dataset):
         max_seq_length: int = 8192,
     ) -> None:
         self.hf_dataset = hf_dataset
-        self.processor = processor
+        self.processor: FaraProcessor = processor
         self.use_multiscale = use_multiscale
         self.sampling_strategy = sampling_strategy
         self.max_n_images = max_n_images
