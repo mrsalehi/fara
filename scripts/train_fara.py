@@ -698,6 +698,68 @@ ASSISTANT_HEADER = "<|im_start|>assistant\n"
 TURN_END = "<|im_end|>"
 
 
+def _count_final_tokens(image_grid_thw: Any, merge_size: int) -> int:
+    if image_grid_thw is None:
+        return 0
+    total = 0
+    for grid in image_grid_thw:
+        if hasattr(grid, "tolist"):
+            grid = grid.tolist()
+        total += int(np.prod(grid)) // (merge_size ** 2)
+    return total
+
+
+class PatchStatsSFTTrainer:
+    def _init_patch_stats(self) -> None:
+        self._patch_baseline_tokens = 0
+        self._patch_final_tokens = 0
+        self._patch_samples = 0
+
+    def _accumulate_patch_stats(self, inputs: Dict[str, Any]) -> None:
+        baseline = inputs.pop("patch_baseline_tokens", None)
+        final = inputs.pop("patch_final_tokens", None)
+        samples = inputs.pop("patch_sample_count", None)
+        if baseline is None or final is None:
+            return
+
+        baseline_value = int(baseline.item()) if torch.is_tensor(baseline) else int(baseline)
+        final_value = int(final.item()) if torch.is_tensor(final) else int(final)
+        samples_value = int(samples.item()) if torch.is_tensor(samples) else int(samples or 0)
+
+        stats = torch.tensor([baseline_value, final_value, samples_value], dtype=torch.long)
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            device = getattr(self.args, "device", torch.device("cpu"))
+            stats = stats.to(device)
+            torch.distributed.all_reduce(stats, op=torch.distributed.ReduceOp.SUM)
+            stats = stats.cpu()
+
+        self._patch_baseline_tokens += int(stats[0].item())
+        self._patch_final_tokens += int(stats[1].item())
+        self._patch_samples += int(stats[2].item())
+
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        if isinstance(inputs, dict):
+            self._accumulate_patch_stats(inputs)
+        return super().training_step(model, inputs, num_items_in_batch)
+
+    def log(self, logs, start_time=None):
+        if getattr(self, "_patch_samples", 0) > 0 and getattr(self, "_patch_baseline_tokens", 0) > 0:
+            logs = {} if logs is None else dict(logs)
+            saved_tokens = self._patch_baseline_tokens - self._patch_final_tokens
+            logs["patch_stats/baseline_tokens"] = self._patch_baseline_tokens
+            logs["patch_stats/final_tokens"] = self._patch_final_tokens
+            logs["patch_stats/tokens_saved"] = saved_tokens
+            logs["patch_stats/reduction_pct"] = (
+                (saved_tokens / self._patch_baseline_tokens) * 100.0
+                if self._patch_baseline_tokens > 0 else 0.0
+            )
+            logs["patch_stats/mean_saved_tokens_per_sample"] = (
+                saved_tokens / self._patch_samples if self._patch_samples > 0 else 0.0
+            )
+            logs["patch_stats/samples"] = self._patch_samples
+        return super().log(logs, start_time)
+
+
 class FaraDataset(torch.utils.data.Dataset):
     """Per-sample processing runs here (in DataLoader workers).
     Returns fully tokenized tensors so the collator only pads/stacks.
@@ -766,6 +828,37 @@ class FaraDataset(torch.utils.data.Dataset):
         if "maybe_positions_multiscale" in enc:
             out["maybe_positions_multiscale"] = enc["maybe_positions_multiscale"]
             out["maybe_centers_multiscale"]   = enc["maybe_centers_multiscale"]
+
+        image_status = enc.get("image_status")
+        if image_status is None:
+            active_images = pil_images
+        else:
+            active_images = [
+                image for i, image in enumerate(pil_images)
+                if (image_status[i] if i < len(image_status) else "active") in {"active", "mid_dup"}
+            ]
+
+        image_processor = self.processor.image_processor
+        baseline_patches = sum(
+            image_processor.get_number_of_image_patches(
+                image.height,
+                image.width,
+                images_kwargs={
+                    "min_pixels": image_processor.min_pixels,
+                    "max_pixels": image_processor.max_pixels,
+                    "patch_size": image_processor.patch_size,
+                    "merge_size": image_processor.merge_size,
+                },
+            )
+            for image in active_images
+        )
+        baseline_tokens = baseline_patches // (image_processor.merge_size ** 2)
+        final_tokens = _count_final_tokens(enc.get("image_grid_thw"), image_processor.merge_size)
+
+        out["patch_baseline_tokens"] = torch.tensor(baseline_tokens, dtype=torch.long)
+        out["patch_final_tokens"] = torch.tensor(final_tokens, dtype=torch.long)
+        out["patch_sample_count"] = torch.tensor(1, dtype=torch.long)
+
         return out
 
 
@@ -802,12 +895,22 @@ class FaraCollator:
                 out["maybe_positions_multiscale"] = torch.cat([ex["maybe_positions_multiscale"] for ex in batch if "maybe_positions_multiscale" in ex])
                 out["maybe_centers_multiscale"]   = torch.cat([ex["maybe_centers_multiscale"]   for ex in batch if "maybe_centers_multiscale"   in ex])
 
+        if any("patch_baseline_tokens" in ex for ex in batch):
+            out["patch_baseline_tokens"] = torch.tensor(
+                sum(int(ex["patch_baseline_tokens"].item()) for ex in batch if "patch_baseline_tokens" in ex),
+                dtype=torch.long,
+            )
+            out["patch_final_tokens"] = torch.tensor(
+                sum(int(ex["patch_final_tokens"].item()) for ex in batch if "patch_final_tokens" in ex),
+                dtype=torch.long,
+            )
+            out["patch_sample_count"] = torch.tensor(
+                sum(int(ex["patch_sample_count"].item()) for ex in batch if "patch_sample_count" in ex),
+                dtype=torch.long,
+            )
+
         return out
 
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
@@ -1066,6 +1169,8 @@ def main() -> None:
             os.environ["WANDB_TAGS"] = args.wandb_tags
     run_name = args.wandb_run_name or os.path.basename(args.output_dir.rstrip("/"))
 
+    log(f"[fara-train] training config: {json.dumps(vars(args), indent=2, default=str)}")
+
     train_args = SFTConfig(
         output_dir=args.output_dir,
         per_device_train_batch_size=args.per_device_batch_size,
@@ -1090,7 +1195,10 @@ def main() -> None:
         fsdp_config=args.fsdp_config,
     )
 
-    trainer = SFTTrainer(
+    class PatchStatsTrainer(PatchStatsSFTTrainer, SFTTrainer):
+        pass
+
+    trainer = PatchStatsTrainer(
         model=model,
         args=train_args,
         train_dataset=train_dataset,
@@ -1098,8 +1206,18 @@ def main() -> None:
         processing_class=processor,
         peft_config=lora_config,
     )
+    trainer._init_patch_stats()
 
     trainer.train()
+
+    if getattr(trainer, "_patch_samples", 0) > 0 and getattr(trainer, "_patch_baseline_tokens", 0) > 0:
+        saved_tokens = trainer._patch_baseline_tokens - trainer._patch_final_tokens
+        reduction_pct = (saved_tokens / trainer._patch_baseline_tokens) * 100.0
+        log(
+            f"[fara-train] training complete: saved {saved_tokens} tokens "
+            f"({reduction_pct:.1f}% reduction) over {trainer._patch_samples} samples"
+        )
+
     trainer.save_model(args.output_dir)
     processor.save_pretrained(args.output_dir)
 

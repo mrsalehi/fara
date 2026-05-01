@@ -122,6 +122,7 @@ class FaraProcessor(Qwen2_5_VLProcessor):
         )
 
         image_inputs = videos_inputs = {}
+        image_status = None
         if images is not None:
             image_inputs = self.image_processor(images=images, **output_kwargs["images_kwargs"])
             # The image processor returns a per-input-image status list to keep
@@ -190,7 +191,10 @@ class FaraProcessor(Qwen2_5_VLProcessor):
             mm_token_type_ids[array_ids == self.image_token_id] = 1
             text_inputs["mm_token_type_ids"] = mm_token_type_ids.tolist()
 
-        return BatchFeature(data={**text_inputs, **image_inputs, **videos_inputs}, tensor_type=return_tensors)
+        result = BatchFeature(data={**text_inputs, **image_inputs, **videos_inputs}, tensor_type=return_tensors)
+        if image_status is not None:
+            result["image_status"] = image_status
+        return result
 
     def _apply_image_status(
         self,
