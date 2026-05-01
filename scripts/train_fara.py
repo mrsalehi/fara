@@ -745,17 +745,15 @@ class PatchStatsSFTTrainer:
     def log(self, logs, start_time=None):
         if getattr(self, "_patch_samples", 0) > 0 and getattr(self, "_patch_baseline_tokens", 0) > 0:
             logs = {} if logs is None else dict(logs)
-            saved_tokens = self._patch_baseline_tokens - self._patch_final_tokens
-            logs["patch_stats/baseline_tokens"] = self._patch_baseline_tokens
-            logs["patch_stats/final_tokens"] = self._patch_final_tokens
-            logs["patch_stats/tokens_saved"] = saved_tokens
-            logs["patch_stats/reduction_pct"] = (
-                (saved_tokens / self._patch_baseline_tokens) * 100.0
-                if self._patch_baseline_tokens > 0 else 0.0
-            )
-            logs["patch_stats/mean_saved_tokens_per_sample"] = (
-                saved_tokens / self._patch_samples if self._patch_samples > 0 else 0.0
-            )
+            # Compute running means (average per sample)
+            mean_baseline_tokens = self._patch_baseline_tokens / self._patch_samples if self._patch_samples > 0 else 0.0
+            mean_final_tokens = self._patch_final_tokens / self._patch_samples if self._patch_samples > 0 else 0.0
+            mean_tokens_saved = mean_baseline_tokens - mean_final_tokens
+            reduction_pct = (mean_tokens_saved / mean_baseline_tokens) * 100.0 if mean_baseline_tokens > 0 else 0.0
+            logs["patch_stats/mean_baseline_tokens_per_sample"] = mean_baseline_tokens
+            logs["patch_stats/mean_final_tokens_per_sample"] = mean_final_tokens
+            logs["patch_stats/mean_tokens_saved_per_sample"] = mean_tokens_saved
+            logs["patch_stats/mean_reduction_pct"] = reduction_pct
             logs["patch_stats/samples"] = self._patch_samples
         return super().log(logs, start_time)
 
