@@ -727,11 +727,12 @@ class PatchStatsSFTTrainer:
         samples_value = int(samples.item()) if torch.is_tensor(samples) else int(samples or 0)
 
         stats = torch.tensor([baseline_value, final_value, samples_value], dtype=torch.long)
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            device = getattr(self.args, "device", torch.device("cpu"))
-            stats = stats.to(device)
-            torch.distributed.all_reduce(stats, op=torch.distributed.ReduceOp.SUM)
-            stats = stats.cpu()
+        # FIXME: commented out for now as we wanna check if this part cause the NCCL errors
+        # if torch.distributed.is_available() and torch.distributed.is_initialized():
+        #     device = getattr(self.args, "device", torch.device("cpu"))
+        #     stats = stats.to(device)
+        #     torch.distributed.all_reduce(stats, op=torch.distributed.ReduceOp.SUM)
+        #     stats = stats.cpu()
 
         self._patch_baseline_tokens += int(stats[0].item())
         self._patch_final_tokens += int(stats[1].item())
@@ -888,7 +889,10 @@ class FaraCollator:
 
         if any("pixel_values" in ex for ex in batch):
             out["pixel_values"]   = torch.cat([ex["pixel_values"]   for ex in batch if "pixel_values"   in ex])
+            # print(f"Collator: concatenated pixel_values with shape {out['pixel_values'].shape}")
             out["image_grid_thw"] = torch.cat([ex["image_grid_thw"] for ex in batch if "image_grid_thw" in ex])
+            # print(f"Collator: image_grid_thw {out['image_grid_thw']}")
+
             if any("maybe_positions_multiscale" in ex for ex in batch):
                 out["maybe_positions_multiscale"] = torch.cat([ex["maybe_positions_multiscale"] for ex in batch if "maybe_positions_multiscale" in ex])
                 out["maybe_centers_multiscale"]   = torch.cat([ex["maybe_centers_multiscale"]   for ex in batch if "maybe_centers_multiscale"   in ex])

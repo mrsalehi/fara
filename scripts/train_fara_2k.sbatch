@@ -48,6 +48,18 @@ REPO_ROOT=/gpfs/projects/raivn/reza/fara/
 LORA_FLAG=""
 [[ "${LORA:-1}" == "1" ]] && LORA_FLAG="--lora"
 
+# Auto-derive W&B tags from active flags / sample count.
+_TAGS=()
+[[ "${LORA:-1}" == "1" ]] && _TAGS+=("lora") || _TAGS+=("fullft")
+case "${EXTRA_ARGS:-}" in *--no_multiscale*) _TAGS+=("singlescale") ;; *) _TAGS+=("multiscale") ;; esac
+_MAX_SAMPLES="${MAX_SAMPLES:-2000}"
+if   (( _MAX_SAMPLES >= 1000 )); then _TAGS+=("$(( _MAX_SAMPLES / 1000 ))k")
+else                                   _TAGS+=("${_MAX_SAMPLES}")
+fi
+_TAGS+=("ep${EPOCHS:-1}")
+WANDB_TAGS_AUTO=$(IFS=,; echo "${_TAGS[*]}")
+WANDB_TAGS="${WANDB_TAGS:-$WANDB_TAGS_AUTO}"
+
 export HF_TOKEN="${HF_TOKEN:-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}"
 export TOKENIZERS_PARALLELISM=false
 
@@ -55,6 +67,10 @@ export TOKENIZERS_PARALLELISM=false
 export FARA_EMPTY_KEPT_DUMP_DIR="${FARA_EMPTY_KEPT_DUMP_DIR:-$REPO_ROOT/results/fara_empty_kept_${SLURM_JOB_ID:-local}}"
 
 echo "[$(date)] starting on $(hostname); GPUs=$NUM_GPUS; output=$OUTPUT_DIR"
+
+BASE_PORT=29500
+OFFSET=$(( RANDOM % 1000 ))  # random offset between 0 and 999
+export MASTER_PORT=$(( BASE_PORT + OFFSET ))
 
 accelerate launch \
   --num_processes "$NUM_GPUS" \
@@ -80,7 +96,7 @@ accelerate launch \
     --wandb_entity mrsalehi \
     --wandb_project fara-multiscale \
     --wandb_run_name "$WANDB_RUN_NAME" \
-    --wandb_tags "${WANDB_TAGS:-lora,multiscale,2k}" \
+    --wandb_tags "$WANDB_TAGS" \
     ${EXTRA_ARGS:-}
 
 echo "[$(date)] done"

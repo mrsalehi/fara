@@ -408,6 +408,7 @@ class Qwen2VLImageProcessor(BaseImageProcessor):
             grid_h = 2
             grid_w = num_patches // 2
             flatten_patches = patches.transpose(1, 2, 0, 3, 4).reshape(-1, temporal_patch_size*patch_size*patch_size*3)
+            # print(f"Image processor: flatten_patches shape: {flatten_patches.shape}, grid_t: {grid_t}, grid_h: {grid_h}, grid_w: {grid_w}, num_patches: {num_patches}")
             return flatten_patches, (grid_t, grid_h, grid_w), positions_multi_scale, centers_multi_scale
 
         return flatten_patches, (grid_t, grid_h, grid_w), None, None
