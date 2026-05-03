@@ -501,6 +501,7 @@ class Qwen2_5_VisionTransformerPretrainedModel(Qwen2_5_VLPreTrainedModel):
         Returns:
             `torch.Tensor`: hidden_states.
         """
+        # print(f"Input hidden states shape: {hidden_states.shape}, device: {hidden_states.device}")
         hidden_states = self.patch_embed(hidden_states)
         rotary_pos_emb = self.rot_pos_emb(grid_thw, maybe_positions_multiscale=maybe_positions_multiscale)
         if maybe_centers_multiscale is not None:
@@ -1337,6 +1338,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
             image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
                 The temporal, height and width of feature shape of each image in LLM.
         """
+        # print("pixel values shape and device:", pixel_values.shape, pixel_values.device)
         pixel_values = pixel_values.type(self.visual.dtype)
         image_embeds = self.visual(
             pixel_values, 

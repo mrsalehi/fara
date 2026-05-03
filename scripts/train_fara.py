@@ -800,6 +800,15 @@ class FaraDataset(torch.utils.data.Dataset):
                 messages, pil_images = _truncate_to_decision_point(
                     messages, pil_images, t, max_n_images=self.max_n_images,
                 )
+        elif self.sampling_strategy == "full_trajectory":
+            n_turns = (len(messages) - 1) // 2
+            if n_turns > 0:
+                messages, pil_images = _truncate_to_decision_point(
+                    messages,
+                    pil_images,
+                    n_turns - 1,
+                    max_n_images=self.max_n_images,
+                )
 
         enc = self.processor(
             messages=messages,
@@ -810,10 +819,18 @@ class FaraDataset(torch.utils.data.Dataset):
             return_tensors="pt",
         )
 
+        # Diagnostic logging for single-image sample detection with rank info
+        # raw_image_count = len(row["images"])
+        # decoded_image_count = len(pil_images)
+        # has_pixel_values = "pixel_values" in enc
+        # has_image_grid_thw = "image_grid_thw" in enc
+        # rank = torch.distributed.get_rank() if torch.distributed.is_available() and torch.distributed.is_initialized() else 0
+        # print(f"[rank {rank}] [sample {idx}] raw_images={raw_image_count} decoded_images={decoded_image_count} has_pixel_values={has_pixel_values} has_image_grid_thw={has_image_grid_thw}")
+
         ids = enc["input_ids"][0].tolist()
         labels = _build_labels(
             ids, self._header_ids, self._end_ids,
-            last_only=(self.sampling_strategy == "decision_point"),
+            last_only=(self.sampling_strategy in {"decision_point", "full_trajectory"}),
         )
 
         out: Dict[str, torch.Tensor] = {
@@ -970,14 +987,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lora", action="store_true",
                    help="LoRA fine-tune instead of full fine-tune.")
     p.add_argument("--sampling_strategy", default="decision_point",
-                   choices=["none", "decision_point"],
+                    choices=["none", "decision_point", "full_trajectory"],
                    help="How to sample within each trajectory at training time. "
                         "'none' = train on the whole trajectory as-is. "
                         "'decision_point' = Strategy A: sample one random step t "
                         "per row, only train on the action at that step, with "
-                        "the last max_n_images_train screenshots kept in context.")
+                        "the last max_n_images_train screenshots kept in context. "
+                        "'full_trajectory' = use the final turn of the full trajectory "
+                        "with the last max_n_images_train screenshots.")
     p.add_argument("--max_n_images_train", type=int, default=3,
-                   help="Image budget when sampling_strategy != 'none'. "
+                    help="Image budget when sampling_strategy is 'decision_point' or 'full_trajectory'. "
                         "Mirrors FaraAgent.max_n_images at inference (default 3).")
     p.add_argument("--freeze_vision", action="store_true",
                    help="Freeze the vision tower (full FT only).")
