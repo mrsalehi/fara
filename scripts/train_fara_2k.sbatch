@@ -52,6 +52,7 @@ LORA_FLAG=""
 _TAGS=()
 [[ "${LORA:-1}" == "1" ]] && _TAGS+=("lora") || _TAGS+=("fullft")
 case "${EXTRA_ARGS:-}" in *--no_multiscale*) _TAGS+=("singlescale") ;; *) _TAGS+=("multiscale") ;; esac
+_TAGS+=("${NUM_GPUS:-auto}gpu")
 _MAX_SAMPLES="${MAX_SAMPLES:-2000}"
 if   (( _MAX_SAMPLES >= 1000 )); then _TAGS+=("$(( _MAX_SAMPLES / 1000 ))k")
 else                                   _TAGS+=("${_MAX_SAMPLES}")
