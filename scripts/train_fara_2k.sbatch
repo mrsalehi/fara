@@ -42,15 +42,24 @@ REPO_ROOT=/gpfs/projects/raivn/reza/fara/
 : "${DATA_PATH:=/gpfs/scrubbed/reza/MolmoWeb-SyntheticTrajs/data/from_template-00000.parquet}"
 : "${MODEL_ID:=microsoft/Fara-7B}"
 : "${OUTPUT_DIR:=$REPO_ROOT/results/fara_sft_2k_${SLURM_JOB_ID:-local}}"
-: "${WANDB_RUN_NAME:=fara-sft-2k-lora-${SLURM_JOB_ID:-local}}"
 
 # LoRA toggle: LORA=1 (default) for LoRA fine-tune, LORA=0 for full FT.
 LORA_FLAG=""
-[[ "${LORA:-1}" == "1" ]] && LORA_FLAG="--lora"
+_FT_TAG="fullft"
+if [[ "${LORA:-1}" == "1" ]]; then
+  LORA_FLAG="--lora"
+  _FT_TAG="lora"
+fi
+
+# Scale tag: add "singlescale" to run name if --no_multiscale is in EXTRA_ARGS
+_SCALE_TAG=""
+if [[ "${EXTRA_ARGS:-}" == *"--no_multiscale"* ]]; then
+  _SCALE_TAG="-singlescale"
+fi
+: "${WANDB_RUN_NAME:=fara-sft-2k-${_FT_TAG}${_SCALE_TAG}-${SLURM_JOB_ID:-local}}"
 
 # Auto-derive W&B tags from active flags / sample count.
-_TAGS=()
-[[ "${LORA:-1}" == "1" ]] && _TAGS+=("lora") || _TAGS+=("fullft")
+_TAGS=("$_FT_TAG")
 case "${EXTRA_ARGS:-}" in *--no_multiscale*) _TAGS+=("singlescale") ;; *) _TAGS+=("multiscale") ;; esac
 _TAGS+=("${NUM_GPUS:-auto}gpu")
 _MAX_SAMPLES="${MAX_SAMPLES:-2000}"
@@ -58,6 +67,8 @@ if   (( _MAX_SAMPLES >= 1000 )); then _TAGS+=("$(( _MAX_SAMPLES / 1000 ))k")
 else                                   _TAGS+=("${_MAX_SAMPLES}")
 fi
 _TAGS+=("ep${EPOCHS:-1}")
+_TAGS+=("${SAMPLING_STRATEGY:-full_trajectory}")
+
 WANDB_TAGS_AUTO=$(IFS=,; echo "${_TAGS[*]}")
 WANDB_TAGS="${WANDB_TAGS:-$WANDB_TAGS_AUTO}"
 
@@ -88,6 +99,7 @@ accelerate launch \
     --logging_steps 1 \
     --save_steps 200 \
     --max_samples ${MAX_SAMPLES:-2000} \
+    --sampling_strategy ${SAMPLING_STRATEGY:-full_trajectory} \
     --bf16 \
     --gradient_checkpointing \
     --attn_implementation sdpa \
