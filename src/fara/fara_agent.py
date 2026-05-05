@@ -130,10 +130,13 @@ class FaraAgent:
         import torch
         from fara.modeling.modeling_qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
         from fara.modeling.image_processing_qwen2_vl import Qwen2VLImageProcessor
-        from transformers import Qwen2_5_VLProcessor
+        from fara.modeling.processing_qwen2_5_vl import FaraProcessor
 
         self.logger.info(f"Loading local model: {self.local_model_id}")
-        self._local_processor = Qwen2_5_VLProcessor.from_pretrained(self.local_model_id)
+        # FaraProcessor pops the non-tensor `image_status` field returned by the
+        # custom Qwen2VLImageProcessor; the stock Qwen2_5_VLProcessor would try
+        # to tensorize it and crash with "too many dimensions 'str'".
+        self._local_processor = FaraProcessor.from_pretrained(self.local_model_id)
         self._local_processor.image_processor = Qwen2VLImageProcessor.from_pretrained(
             self.local_model_id
         )
