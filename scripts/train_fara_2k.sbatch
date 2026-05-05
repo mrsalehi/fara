@@ -137,6 +137,7 @@ accelerate launch \
     --max_seq_length ${MAX_SEQ_LENGTH:-16384} \
     --logging_steps 1 \
     --save_steps 128 \
+    --save_total_limit ${SAVE_TOTAL_LIMIT:-3} \
     ${MAX_SAMPLES_FLAG} \
     ${VAL_FLAGS} \
     ${VISION_LR_FLAGS} \

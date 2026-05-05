@@ -1021,6 +1021,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--weight_decay", type=float, default=0.0)
     p.add_argument("--logging_steps", type=int, default=10)
     p.add_argument("--save_steps", type=int, default=500)
+    p.add_argument("--save_total_limit", type=int, default=3,
+                   help="Max number of checkpoints to keep on disk. "
+                        "Older ones are deleted. Set to None/0 to keep all.")
     p.add_argument("--max_samples", type=int, default=None,
                    help="Cap dataset size (useful for smoke tests).")
     p.add_argument("--shuffle_seed", type=int, default=42,
@@ -1367,7 +1370,7 @@ def main() -> None:
         max_length=args.max_seq_length,
         report_to=report_to,
         run_name=run_name,
-        save_total_limit=3,
+        save_total_limit=args.save_total_limit if args.save_total_limit else None,
         optim="adamw_torch",
         fsdp=fsdp_value,
         fsdp_config=args.fsdp_config,
