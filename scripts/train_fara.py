@@ -21,19 +21,21 @@ Install deps in the training env (NOT the fara_webeval env):
 import argparse
 import io
 import json
+import logging
 import os
 import random
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
+import hashlib
 
 # Prevent DeepSpeed import-time CUDA op probing from failing when using FSDP-only training.
 os.environ.setdefault("DS_IGNORE_CUDA_DETECTION", "1")
 
 import numpy as np
 import torch
-from datasets import load_dataset
+from datasets import load_dataset, load_from_disk
 from PIL import Image
 from transformers import Qwen2_5_VLProcessor
 from fara.modeling.processing_qwen2_5_vl import FaraProcessor
@@ -41,7 +43,7 @@ from fara.modeling.processing_qwen2_5_vl import FaraProcessor
 from fara.modeling.modeling_qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
 from fara.modeling.image_processing_qwen2_vl import Qwen2VLImageProcessor
 from fara._prompts import get_computer_use_system_prompt
-from fara.training_utils import log, setup_logging
+from fara.training_utils import is_main_process, log, setup_logging
 
 setup_logging()
 
@@ -65,6 +67,12 @@ MAX_URL_LENGTH = 100         # mirrors FaraAgent.MAX_URL_LENGTH
 # ---------------------------------------------------------------------------
 # Dataset adapter: parquet row -> chat messages
 # ---------------------------------------------------------------------------
+
+def _filter_cache_key(args: Any) -> str:
+    domains = sorted(d.strip().lower() for d in args.allowed_domains.split(",") if d.strip())
+    key_str = f"{args.data_path}|{','.join(domains)}|{args.domain_filter_mode}"
+    return hashlib.md5(key_str.encode()).hexdigest()[:12]
+
 
 def _decode_image(img_entry: Any) -> Image.Image:
     """Decode one image entry. Schema-tolerant."""
@@ -715,6 +723,61 @@ class PatchStatsSFTTrainer:
         self._patch_final_tokens = 0
         self._patch_samples = 0
 
+    def create_optimizer(self):
+        if self.optimizer is not None:
+            return self.optimizer
+
+        from transformers import Trainer
+        decay_names = set(self.get_decay_parameter_names(self.model))
+
+        def is_vision(name: str) -> bool:
+            return name.startswith("visual.") or ".visual." in name
+
+        groups = {
+            ("vision", True):  {"params": [], "lr": self.args.vision_learning_rate,
+                                "weight_decay": self.args.weight_decay},
+            ("vision", False): {"params": [], "lr": self.args.vision_learning_rate,
+                                "weight_decay": 0.0},
+            ("llm", True):     {"params": [], "lr": self.args.learning_rate,
+                                "weight_decay": self.args.weight_decay},
+            ("llm", False):    {"params": [], "lr": self.args.learning_rate,
+                                "weight_decay": 0.0},
+        }
+
+        for n, p in self.model.named_parameters():
+            if not p.requires_grad:
+                continue
+            kind = "vision" if is_vision(n) else "llm"
+            decays = n in decay_names
+            groups[(kind, decays)]["params"].append(p)
+        
+        param_groups = [g for g in groups.values() if g["params"]]
+        optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args)
+        optimizer_kwargs.pop("lr", None)
+        self.optimizer = optimizer_cls(param_groups, **optimizer_kwargs)
+
+        # Optional: log group sizes once
+        if is_main_process():
+            for g in param_groups:
+                n_params = sum(p.numel() for p in g["params"])
+                log(f"[fara-train] optim group lr={g['lr']:.2e} wd={g['weight_decay']} params={n_params:,}")
+
+            # Warn when vision LR was set but no trainable vision params exist
+            # (e.g., default LoRA only injects into LLM attn modules, or --freeze_vision).
+            vision_lr = self.args.vision_learning_rate
+            has_vision_group = any(
+                g["lr"] == vision_lr and g["params"] for g in param_groups
+            )
+            if not has_vision_group and vision_lr != self.args.learning_rate:
+                log(
+                    f"[fara-train] vision_learning_rate={vision_lr:.2e} set but no "
+                    f"trainable vision params found (likely default LoRA target_modules "
+                    f"or --freeze_vision). Vision LR is a no-op for this run.",
+                    level=logging.WARNING,
+                )
+
+        return self.optimizer
+
     def _accumulate_patch_stats(self, inputs: Dict[str, Any]) -> None:
         baseline = inputs.pop("patch_baseline_tokens", None)
         final = inputs.pop("patch_final_tokens", None)
@@ -727,12 +790,13 @@ class PatchStatsSFTTrainer:
         samples_value = int(samples.item()) if torch.is_tensor(samples) else int(samples or 0)
 
         stats = torch.tensor([baseline_value, final_value, samples_value], dtype=torch.long)
-        # FIXME: commented out for now as we wanna check if this part cause the NCCL errors
-        # if torch.distributed.is_available() and torch.distributed.is_initialized():
-        #     device = getattr(self.args, "device", torch.device("cpu"))
-        #     stats = stats.to(device)
-        #     torch.distributed.all_reduce(stats, op=torch.distributed.ReduceOp.SUM)
-        #     stats = stats.cpu()
+
+        # NOTE: make sure that this part won't cause NCCL errors in the future
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            device = getattr(self.args, "device", torch.device("cpu"))
+            stats = stats.to(device)
+            torch.distributed.all_reduce(stats, op=torch.distributed.ReduceOp.SUM)
+            stats = stats.cpu()
 
         self._patch_baseline_tokens += int(stats[0].item())
         self._patch_final_tokens += int(stats[1].item())
@@ -943,7 +1007,14 @@ def parse_args() -> argparse.Namespace:
     # Training hyperparams
     p.add_argument("--per_device_batch_size", type=int, default=1)
     p.add_argument("--gradient_accumulation_steps", type=int, default=8)
-    p.add_argument("--learning_rate", type=float, default=1e-5)
+    p.add_argument("--learning_rate", type=float, default=1e-5,
+                   help="Base LR (used for LLM params).")
+    p.add_argument("--vision_learning_rate", type=float, default=None,
+                   help="LR for vision-encoder params (visual.*). "
+                        "Overrides --vision_lr_ratio when set.")
+    p.add_argument("--vision_lr_ratio", type=float, default=0.1,
+                   help="Vision-encoder LR as a fraction of --learning_rate. "
+                        "Used only when --vision_learning_rate is unset.")
     p.add_argument("--num_epochs", type=float, default=1.0)
     p.add_argument("--max_seq_length", type=int, default=8192)
     p.add_argument("--warmup_ratio", type=float, default=0.03)
@@ -952,6 +1023,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--save_steps", type=int, default=500)
     p.add_argument("--max_samples", type=int, default=None,
                    help="Cap dataset size (useful for smoke tests).")
+    p.add_argument("--shuffle_seed", type=int, default=42,
+                   help="Seed for shuffling the dataset before max_samples / "
+                        "train-val split. Set to a negative value to disable.")
+    p.add_argument("--val_split_ratio", type=float, default=0.0,
+                   help="Fraction of the dataset to hold out as a validation set "
+                        "(e.g., 0.02). 0 disables validation.")
+    p.add_argument("--val_max_samples", type=int, default=None,
+                   help="Cap the held-out val set after splitting.")
+    p.add_argument("--val_split_seed", type=int, default=42,
+                   help="Seed used for the deterministic train/val split.")
+    p.add_argument("--eval_steps", type=int, default=500,
+                   help="Run eval every N steps (only when val set is enabled).")
+    p.add_argument("--per_device_eval_batch_size", type=int, default=None,
+                   help="Per-device eval batch size. Defaults to per_device_batch_size.")
     p.add_argument(
         "--allowed_domains",
         default="",
@@ -968,6 +1053,14 @@ def parse_args() -> argparse.Namespace:
             "Domain filtering mode when --allowed_domains is set: "
             "'any' keeps rows with at least one allowed domain in trajectory; "
             "'strict' keeps rows only if all observed domains are in allowlist."
+        ),
+    )
+    p.add_argument(
+        "--data_cache_root",
+        default="/gpfs/scrubbed/reza/fara/data_cache",
+        help=(
+            "Directory for the post-domain-filter Dataset cache. "
+            "Set to empty string to disable caching."
         ),
     )
     p.add_argument("--report_to", default="none",
@@ -1066,33 +1159,66 @@ def maybe_wrap_peft(model, args):
 
 
 def build_dataset(args: argparse.Namespace, processor: Qwen2_5_VLProcessor):
-    ds = load_dataset("parquet", data_files=args.data_path, split="train")
+    filter_cache = None
+    if args.data_cache_root:
+        filter_cache = os.path.join(
+            args.data_cache_root, f"filtered-{_filter_cache_key(args)}"
+        )
 
-    allowed_domains = [d.strip().lower() for d in args.allowed_domains.split(",") if d.strip()]
-    allowed_domains = [d[4:] if d.startswith("www.") else d for d in allowed_domains]
-    if allowed_domains:
+    def _load_and_filter() -> Any:
+        if os.path.isdir(args.data_path):
+            ds_local = load_dataset("parquet", data_dir=args.data_path, split="train", num_proc=4)
+        else:
+            ds_local = load_dataset("parquet", data_files=args.data_path, split="train", num_proc=4)
+
+        allowed_domains = [d.strip().lower() for d in args.allowed_domains.split(",") if d.strip()]
+        allowed_domains = [d[4:] if d.startswith("www.") else d for d in allowed_domains]
+        if not allowed_domains:
+            return ds_local
+
         log(f"[fara-train] applying domain allowlist ({args.domain_filter_mode}): {allowed_domains}")
 
         def _keep_row(row: Dict[str, Any]) -> bool:
             domains = _extract_row_domains(row.get("trajectory"))
             if not domains:
                 return False
-
             if args.domain_filter_mode == "strict":
                 return all(_domain_allowed(d, allowed_domains) for d in domains)
-
-            # args.domain_filter_mode == "any"
             return any(_domain_allowed(d, allowed_domains) for d in domains)
 
-        before = len(ds)
-        ds = ds.filter(_keep_row, num_proc=4)
-        after = len(ds)
+        before = len(ds_local)
+        ds_local = ds_local.filter(_keep_row, num_proc=4)
+        after = len(ds_local)
         log(f"[fara-train] domain filter kept {after}/{before} rows")
-
         if after == 0:
             raise ValueError(
                 "Domain filter removed all rows. Verify --allowed_domains and trajectory URL extraction."
             )
+        return ds_local
+
+    # Multi-rank coordination: main builds + saves, others wait + load_from_disk.
+    if filter_cache:
+        if is_main_process() and not os.path.isdir(filter_cache):
+            ds = _load_and_filter()
+            log(f"[fara-train] saving filtered dataset to {filter_cache}")
+            os.makedirs(args.data_cache_root, exist_ok=True)
+            ds.save_to_disk(filter_cache)
+            del ds  # main re-loads from cache below for state parity with other ranks
+
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.barrier()
+
+        log(f"[fara-train] loading filtered dataset from cache: {filter_cache}")
+        ds = load_from_disk(filter_cache)
+    else:
+        # Caching disabled: every rank rebuilds independently. CPU-redundant
+        # but no on-disk race.
+        ds = _load_and_filter()
+
+    if args.shuffle_seed is not None and args.shuffle_seed >= 0:
+        log(f"[fara-train] shuffling dataset with seed={args.shuffle_seed} "
+            f"(n={len(ds)})")
+        ds = ds.shuffle(seed=args.shuffle_seed)
 
     if args.max_samples is not None:
         ds = ds.select(range(min(args.max_samples, len(ds))))
@@ -1123,6 +1249,7 @@ def build_dataset(args: argparse.Namespace, processor: Qwen2_5_VLProcessor):
         fn_kwargs={"system_prompt_text": system_prompt_text},
         remove_columns=ds.column_names,
         num_proc=4,
+        writer_batch_size=128,
     )
 
     # Drop trajectories where any step had an unmapped action — `row_to_messages`
@@ -1155,7 +1282,23 @@ def main() -> None:
     model, lora_config = maybe_wrap_peft(model, args)
 
     hf_dataset = build_dataset(args, processor)
-    log(f"[fara-train] dataset size = {len(hf_dataset)}")
+
+    eval_hf_dataset = None
+    if args.val_split_ratio and args.val_split_ratio > 0:
+        if not (0 < args.val_split_ratio < 1):
+            raise ValueError(f"--val_split_ratio must be in (0, 1); got {args.val_split_ratio}")
+        split = hf_dataset.train_test_split(
+            test_size=args.val_split_ratio, seed=args.val_split_seed
+        )
+        hf_dataset, eval_hf_dataset = split["train"], split["test"]
+        if args.val_max_samples is not None:
+            eval_hf_dataset = eval_hf_dataset.select(
+                range(min(args.val_max_samples, len(eval_hf_dataset)))
+            )
+        log(f"[fara-train] held-out val set size = {len(eval_hf_dataset)} "
+            f"(ratio={args.val_split_ratio}, seed={args.val_split_seed})")
+
+    log(f"[fara-train] train dataset size = {len(hf_dataset)}")
 
     train_dataset = FaraDataset(
         hf_dataset=hf_dataset,
@@ -1165,6 +1308,17 @@ def main() -> None:
         max_n_images=args.max_n_images_train,
         max_seq_length=args.max_seq_length,
     )
+
+    eval_dataset = None
+    if eval_hf_dataset is not None:
+        eval_dataset = FaraDataset(
+            hf_dataset=eval_hf_dataset,
+            processor=processor,
+            use_multiscale=not args.no_multiscale,
+            sampling_strategy=args.sampling_strategy,
+            max_n_images=args.max_n_images_train,
+            max_seq_length=args.max_seq_length,
+        )
 
     tok = processor.tokenizer
     pad_id = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
@@ -1195,6 +1349,7 @@ def main() -> None:
     train_args = SFTConfig(
         output_dir=args.output_dir,
         per_device_train_batch_size=args.per_device_batch_size,
+        per_device_eval_batch_size=args.per_device_eval_batch_size or args.per_device_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         num_train_epochs=args.num_epochs,
         learning_rate=args.learning_rate,
@@ -1202,6 +1357,8 @@ def main() -> None:
         weight_decay=args.weight_decay,
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
+        eval_strategy="steps" if eval_dataset is not None else "no",
+        eval_steps=args.eval_steps if eval_dataset is not None else None,
         bf16=args.bf16 and not args.fp16,
         fp16=args.fp16,
         gradient_checkpointing=args.gradient_checkpointing,
@@ -1216,6 +1373,14 @@ def main() -> None:
         fsdp_config=args.fsdp_config,
     )
 
+    # Resolve vision LR: explicit > ratio.
+    if args.vision_learning_rate is not None:
+        train_args.vision_learning_rate = args.vision_learning_rate
+    else:
+        train_args.vision_learning_rate = args.learning_rate * args.vision_lr_ratio
+    log(f"[fara-train] LLM lr={args.learning_rate:.2e} | "
+        f"vision lr={train_args.vision_learning_rate:.2e}")
+
     class PatchStatsTrainer(PatchStatsSFTTrainer, SFTTrainer):
         pass
 
@@ -1223,6 +1388,7 @@ def main() -> None:
         model=model,
         args=train_args,
         train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
         data_collator=collator,
         processing_class=processor,
         peft_config=lora_config,
