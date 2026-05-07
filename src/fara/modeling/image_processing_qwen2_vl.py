@@ -498,50 +498,26 @@ class Qwen2VLImageProcessor(BaseImageProcessor):
         return {
             'frames': traj_frames,
             'per_frame': per_frame,
-            # 'n_skipped_blank': n_skipped,
-            # 'trailing_dup_dropped': trailing_dup,
         }
 
     def _compute_image_status(self, traj_data, images) -> list:
         """Per-input-image status used to keep messages and pixel_values aligned.
 
-        Decides between: 'active', 'blank_first', 'blank_drop', 'mid_dup',
-        'trailing_dup'. Multiscale uses kept_patches from process_trajectory
-        for mid_dup detection; single-scale only flags blank/trailing.
+        Returns 'active' or 'mid_dup' per input image. 'mid_dup' is flagged
+        when multiscale process_trajectory produced an empty kept_patches list
+        (i.e. the frame is fully redundant relative to its predecessor).
+
+        Blank-prefix and trailing-duplicate frames are handled offline by
+        scripts/preprocess_trajectories.py and never reach this codepath at
+        training time. Without traj_data (single-scale), every frame is active.
         """
-        if traj_data is not None:
-            frames = traj_data['frames']
-            per_frame = traj_data['per_frame']
-        else:
-            frames = [np.asarray(convert_to_rgb(img) if hasattr(img, 'convert') else img,
-                                 dtype=np.uint8) for img in images]
-            per_frame = None
-
-        status: list = []
-        in_blank_prefix = True
-        for i, frame in enumerate(frames):
-            is_blank = float(frame.astype(np.float32).var()) == 0.0
-            kept_empty = (
-                per_frame is not None
-                and len(per_frame[i].get('kept_patches', [])) == 0
-            )
-
-            if is_blank and in_blank_prefix:
-                status.append('blank_first' if i == 0 else 'blank_drop')
-            elif kept_empty:
-                in_blank_prefix = False
-                status.append('mid_dup')
-            else:
-                in_blank_prefix = False
-                status.append('active')
-
-        # Trailing dup: last frame pixel-identical to the penultimate.
-        if (len(frames) >= 2
-                and status[-1] == 'active'
-                and frames[-1].shape == frames[-2].shape
-                and np.array_equal(frames[-1], frames[-2])):
-            status[-1] = 'trailing_dup'
-        return status
+        if traj_data is None:
+            return ['active'] * len(images)
+        per_frame = traj_data['per_frame']
+        return [
+            'mid_dup' if len(per_frame[i].get('kept_patches', [])) == 0 else 'active'
+            for i in range(len(per_frame))
+        ]
 
     def _dump_empty_kept_case(self, idx, current_image, images, traj_data):
         """Dump the current frame + its predecessor + diff_frame visualization
@@ -780,11 +756,9 @@ class Qwen2VLImageProcessor(BaseImageProcessor):
 
             # Decide a per-input-image status the parent processor can use to
             # update messages in sync with the filtered image set:
-            #   "active"        — visual content kept, included in pixel_values/grid_thw
-            #   "blank_first"   — leading blank, idx 0; user_0 keeps task text, drops image
-            #   "blank_drop"    — leading blank, idx >= 1; drop user+assistant pair
-            #   "mid_dup"       — fully redundant frame (kept=[]); drop image, replace text
-            #   "trailing_dup"  — last frame identical to penult; drop user+assistant pair
+            #   "active"   — visual content kept, included in pixel_values/grid_thw
+            #   "mid_dup"  — fully redundant frame (kept=[]); drop image, replace text
+            # Blank-prefix and trailing-dup frames are handled offline.
             image_status: list = self._compute_image_status(traj_data, images)
 
             pixel_values, vision_grid_thws = [], []

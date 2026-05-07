@@ -76,6 +76,7 @@ class FaraProcessor(Qwen2_5_VLProcessor):
         text: Union[TextInput, PreTokenizedInput, list[TextInput], list[PreTokenizedInput]] = None,
         videos=None,
         messages: Optional[List[Dict[str, Any]]] = None,
+        add_generation_prompt: bool = False,
         **kwargs: Unpack[Qwen2_5_VLProcessorKwargs],
     ) -> BatchFeature:
         """
@@ -133,12 +134,12 @@ class FaraProcessor(Qwen2_5_VLProcessor):
             if messages is not None and image_status is not None:
                 messages = self._apply_image_status(messages, image_status)
                 text = self.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=False,
+                    messages, tokenize=False, add_generation_prompt=add_generation_prompt,
                 )
             image_grid_thw = image_inputs.get("image_grid_thw")
         elif messages is not None:
             text = self.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=False,
+                messages, tokenize=False, add_generation_prompt=add_generation_prompt,
             )
 
         if videos is not None:
@@ -203,22 +204,17 @@ class FaraProcessor(Qwen2_5_VLProcessor):
     ) -> List[Dict[str, Any]]:
         """Update `messages` in sync with the per-input-image status returned
         by `Qwen2VLImageProcessor.preprocess`. The status drives:
-          'active'        → keep message as-is (image stays in pixel_values)
-          'blank_first'   → strip image placeholder, keep task text
-          'blank_drop'    → drop the user turn AND its following assistant turn
-          'trailing_dup'  → drop the user turn AND its following assistant turn
-          'mid_dup'       → strip image placeholder, replace USER_MESSAGE
-                            with USER_MESSAGE_REDUNDANT marker text
+          'active'   → keep message as-is (image stays in pixel_values)
+          'mid_dup'  → strip image placeholder, replace USER_MESSAGE with
+                       USER_MESSAGE_REDUNDANT marker text
+
+        Blank-prefix and trailing-duplicate frames are handled offline by
+        scripts/preprocess_trajectories.py and never reach this codepath.
         """
         new_messages: List[Dict[str, Any]] = []
         ci = 0
-        skip_next = False
 
         for msg in messages:
-            if skip_next:
-                skip_next = False
-                continue
-
             if msg["role"] != "user":
                 new_messages.append(msg)
                 continue
@@ -234,17 +230,7 @@ class FaraProcessor(Qwen2_5_VLProcessor):
             status = image_status[ci] if ci < len(image_status) else "active"
             ci += 1
 
-            if status in ("blank_drop", "trailing_dup"):
-                skip_next = True   # also drop the following assistant turn
-                continue
-
-            if status == "blank_first":
-                content = [
-                    c for c in msg["content"]
-                    if not (isinstance(c, dict) and c.get("type") == "image")
-                ]
-                new_messages.append({"role": "user", "content": content})
-            elif status == "mid_dup":
+            if status == "mid_dup":
                 content = []
                 for c in msg["content"]:
                     if isinstance(c, dict) and c.get("type") == "image":

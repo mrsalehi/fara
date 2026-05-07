@@ -189,25 +189,29 @@ class FaraAgent:
 
         messages = self._history_to_qwen_messages(history)
 
-        # Collect PIL images in order for the processor
+        # Collect PIL images in the same order as their {"type":"image"} markers.
         images = []
         for msg in messages:
             if isinstance(msg["content"], list):
                 for item in msg["content"]:
                     if item.get("type") == "image":
                         images.append(item["image"])
-                        # Replace PIL image with Qwen's image placeholder for text template
-                        item["image"] = item.pop("image")
 
-        text = self._local_processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True,
-        )
+        # Pass messages= (not pre-templated text) so FaraProcessor can run the
+        # image-status filter and re-template atomically — keeps placeholders
+        # in sync with pixel_values when the image processor drops frames
+        # (blank/duplicate detection).
         inputs = self._local_processor(
-            text=[text],
+            messages=messages,
             images=images if images else None,
             padding=True,
             return_tensors="pt",
+            add_generation_prompt=True,
         ).to(self._local_model.device)
+
+        # `image_status` is metadata for the processor's own bookkeeping; the
+        # model's generate() rejects unknown kwargs, so strip it.
+        inputs.pop("image_status", None)
 
         with torch.no_grad():
             generated_ids = self._local_model.generate(
