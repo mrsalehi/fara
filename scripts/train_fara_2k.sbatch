@@ -47,7 +47,7 @@ conda activate fara_webeval
 REPO_ROOT=/gpfs/projects/raivn/reza/fara/
 
 : "${NUM_GPUS:=$(python -c 'import torch; print(torch.cuda.device_count())')}"
-: "${DATA_PATH:=/gpfs/scrubbed/reza/MolmoWeb-SyntheticTrajs/data/}"
+: "${DATA_PATH:=/gpfs/scrubbed/reza/MolmoWeb-SyntheticTrajs/data_filtered/}"
 : "${MODEL_ID:=microsoft/Fara-7B}"
 : "${RESULTS_ROOT:=/gpfs/scrubbed/reza/fara/results}"
 
