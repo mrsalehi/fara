@@ -25,6 +25,7 @@ import logging
 import os
 import random
 import re
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
@@ -1200,16 +1201,22 @@ def build_dataset(args: argparse.Namespace, processor: Qwen2_5_VLProcessor):
         return ds_local
 
     # Multi-rank coordination: main builds + saves, others wait + load_from_disk.
+    # The HF Trainer process group isn't initialized yet at this point in main(),
+    # so torch.distributed.barrier() would be a no-op. Use a filesystem sentinel
+    # instead — main writes it after save_to_disk completes, others poll for it.
     if filter_cache:
-        if is_main_process() and not os.path.isdir(filter_cache):
-            ds = _load_and_filter()
-            log(f"[fara-train] saving filtered dataset to {filter_cache}")
-            os.makedirs(args.data_cache_root, exist_ok=True)
-            ds.save_to_disk(filter_cache)
-            del ds  # main re-loads from cache below for state parity with other ranks
-
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            torch.distributed.barrier()
+        sentinel = filter_cache + ".done"
+        if is_main_process():
+            if not os.path.isdir(filter_cache):
+                ds = _load_and_filter()
+                log(f"[fara-train] saving filtered dataset to {filter_cache}")
+                os.makedirs(args.data_cache_root, exist_ok=True)
+                ds.save_to_disk(filter_cache)
+                del ds  # re-loaded from cache below for state parity with other ranks
+            open(sentinel, "w").close()
+        else:
+            while not os.path.exists(sentinel):
+                time.sleep(2)
 
         log(f"[fara-train] loading filtered dataset from cache: {filter_cache}")
         ds = load_from_disk(filter_cache)
