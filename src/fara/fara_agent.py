@@ -102,6 +102,11 @@ class FaraAgent:
         self._local_model = None
         self._local_processor = None
         self._chat_history: List[LLMMessage] = []
+        # Cached output of FaraProcessor's image trajectory diffing. Reused across
+        # consecutive `_make_local_model_call` invocations so the per-frame
+        # quadtree/diff is only run on the newly-appended screenshot.
+        # Reset by `reset()` at the start of every new agent run.
+        self._traj_data_cache: Optional[Dict[str, Any]] = None
 
     async def initialize(self) -> None:
         if self.did_initialize:
@@ -207,11 +212,15 @@ class FaraAgent:
             padding=True,
             return_tensors="pt",
             add_generation_prompt=True,
+            prev_traj_data=self._traj_data_cache,
         ).to(self._local_model.device)
 
         # `image_status` is metadata for the processor's own bookkeeping; the
-        # model's generate() rejects unknown kwargs, so strip it.
+        # model's generate() rejects unknown kwargs, so strip it. `traj_data`
+        # is the updated patch-diff cache — stash it for the next call so we
+        # only diff the newly-appended screenshot, then strip it from inputs.
         inputs.pop("image_status", None)
+        self._traj_data_cache = inputs.pop("traj_data", None)
 
         with torch.no_grad():
             generated_ids = self._local_model.generate(

@@ -77,6 +77,7 @@ class FaraProcessor(Qwen2_5_VLProcessor):
         videos=None,
         messages: Optional[List[Dict[str, Any]]] = None,
         add_generation_prompt: bool = False,
+        prev_traj_data: Optional[Dict[str, Any]] = None,
         **kwargs: Unpack[Qwen2_5_VLProcessorKwargs],
     ) -> BatchFeature:
         """
@@ -124,11 +125,19 @@ class FaraProcessor(Qwen2_5_VLProcessor):
 
         image_inputs = videos_inputs = {}
         image_status = None
+        traj_data = None
         if images is not None:
-            image_inputs = self.image_processor(images=images, **output_kwargs["images_kwargs"])
+            image_inputs = self.image_processor(
+                images=images,
+                prev_traj_data=prev_traj_data,
+                **output_kwargs["images_kwargs"],
+            )
             # The image processor returns a per-input-image status list to keep
             # message placeholders aligned with the (filtered) pixel tensors.
             image_status = image_inputs.pop("image_status", None)
+            # traj_data is the cache the caller can pass back next call as
+            # `prev_traj_data` to skip diffing already-seen frames.
+            traj_data = image_inputs.pop("traj_data", None)
             # When messages were provided, update them in sync with image_status,
             # then derive the templated text from the filtered messages.
             if messages is not None and image_status is not None:
@@ -195,6 +204,8 @@ class FaraProcessor(Qwen2_5_VLProcessor):
         result = BatchFeature(data={**text_inputs, **image_inputs, **videos_inputs}, tensor_type=return_tensors)
         if image_status is not None:
             result["image_status"] = image_status
+        if traj_data is not None:
+            result["traj_data"] = traj_data
         return result
 
     def _apply_image_status(

@@ -425,6 +425,7 @@ class Qwen2VLImageProcessor(BaseImageProcessor):
         input_data_format,
         var_thresh=100.0,
         mse_thresh=10.0,
+        prev_traj_data=None,
     ):
         """
         Run the trajectory patch algorithm on the full frame list.
@@ -445,45 +446,36 @@ class Qwen2VLImageProcessor(BaseImageProcessor):
         or None if `images` is empty.
         """
         from fara.modeling.trajectory_patch import process_trajectory
+        from fara.modeling.trajectory_patch import group_patches_by_size as _group_by_size
 
         if not images:
             return None
 
-        frames = images
-        if do_convert_rgb:
-            frames = [convert_to_rgb(f) for f in frames]
-        frames = [to_numpy_array(f) for f in frames]
-
-        fmt = input_data_format
-        if fmt is None:
-            fmt = infer_channel_dimension_format(frames[0])
-
-        traj_frames = []
-        for f in frames:
+        def _resize_one(img):
+            """Run the same convert/resize/format pipeline used for full trajectories
+            on a single image. Returns an HWC uint8 numpy array.
+            """
+            f = img
+            if do_convert_rgb:
+                f = convert_to_rgb(f)
+            f = to_numpy_array(f)
+            fmt_local = input_data_format or infer_channel_dimension_format(f)
             if do_resize:
-                h, w = get_image_size(f, channel_dim=fmt)
+                h, w = get_image_size(f, channel_dim=fmt_local)
                 rh, rw = smart_resize(
                     h, w,
                     factor=patch_size * merge_size,
                     min_pixels=size["shortest_edge"],
                     max_pixels=size["longest_edge"],
                 )
-                f = resize(f, size=(rh, rw), resample=resample, input_data_format=fmt)
-            f = to_channel_dimension_format(f, ChannelDimension.LAST, input_channel_dim=fmt)
+                f = resize(f, size=(rh, rw), resample=resample, input_data_format=fmt_local)
+            f = to_channel_dimension_format(f, ChannelDimension.LAST, input_channel_dim=fmt_local)
             if f.dtype != np.uint8:
                 f = np.clip(f, 0, 255).astype(np.uint8)
-            traj_frames.append(f)
+            return f
 
-        traj_results = process_trajectory(
-            traj_frames, var_thresh=var_thresh, mse_thresh=mse_thresh,
-        )
-
-        from fara.modeling.trajectory_patch import group_patches_by_size as _group_by_size
-
-        # One per_frame entry per input frame; `kept_patches == []` indicates a
-        # fully-redundant frame (caller decides whether/how to drop it).
-        per_frame = [
-            {
+        def _build_per_frame(r):
+            return {
                 'frame_idx':       r['frame_idx'],
                 'kept_patches':    r['kept_patches'],
                 'dropped_patches': r['dropped_patches'],
@@ -493,8 +485,35 @@ class Qwen2VLImageProcessor(BaseImageProcessor):
                 'scroll_dy':       r['scroll_dy'],
                 '_img':            r['img'],
             }
-            for r in traj_results
-        ]
+
+        # Fast path: caller passed cached traj_data for an N-1 length history and
+        # appended exactly one new image. Reuse cached frames/per_frame for indices
+        # 0..N-2 and only diff the new frame against the previous one.
+        if (
+            prev_traj_data is not None
+            and len(prev_traj_data.get('frames', [])) == len(images) - 1
+            and len(images) >= 2
+        ):
+            new_frame = _resize_one(images[-1])
+            prev_frame = prev_traj_data['frames'][-1]
+            # 2-frame call: frame 0 result is intra-frame quadtree on prev (discarded);
+            # frame 1 is the diff of new_frame against prev_frame (the only one we keep).
+            pair_results = process_trajectory(
+                [prev_frame, new_frame], var_thresh=var_thresh, mse_thresh=mse_thresh,
+            )
+            new_entry = _build_per_frame(pair_results[1])
+            new_entry['frame_idx'] = len(images) - 1
+            return {
+                'frames':    list(prev_traj_data['frames']) + [new_frame],
+                'per_frame': list(prev_traj_data['per_frame']) + [new_entry],
+            }
+
+        # Slow path: full recomputation across the whole image list.
+        traj_frames = [_resize_one(f) for f in images]
+        traj_results = process_trajectory(
+            traj_frames, var_thresh=var_thresh, mse_thresh=mse_thresh,
+        )
+        per_frame = [_build_per_frame(r) for r in traj_results]
         return {
             'frames': traj_frames,
             'per_frame': per_frame,
@@ -632,6 +651,7 @@ class Qwen2VLImageProcessor(BaseImageProcessor):
         return_tensors: Optional[Union[str, TensorType]] = None,
         data_format: Optional[ChannelDimension] = ChannelDimension.FIRST,
         input_data_format: Optional[Union[str, ChannelDimension]] = None,
+        prev_traj_data: Optional[dict] = None,
     ):
         """
         Args:
@@ -749,6 +769,7 @@ class Qwen2VLImageProcessor(BaseImageProcessor):
                     patch_size=patch_size,
                     merge_size=merge_size,
                     input_data_format=input_data_format,
+                    prev_traj_data=prev_traj_data,
                 )
             else:
                 traj_data = None
@@ -844,11 +865,16 @@ class Qwen2VLImageProcessor(BaseImageProcessor):
             )
 
         result = BatchFeature(data=data, tensor_type=return_tensors)
-        
+
         # Add image_status back (not tensorized, stored as-is)
         if image_status is not None:
             result["image_status"] = image_status
-        
+        # Surface traj_data so callers (FaraAgent at inference) can re-cache it
+        # and pass it back as `prev_traj_data` next step to avoid recomputing
+        # diffs for older frames. Stored as a Python dict (not tensorized).
+        if images is not None and self.use_multiscale and traj_data is not None:
+            result["traj_data"] = traj_data
+
         return result
 
     def get_number_of_image_patches(self, height: int, width: int, images_kwargs=None):
