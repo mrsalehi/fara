@@ -195,3 +195,6 @@ webeval/scripts/tmp/
 
 results/
 fara-traj-viz-debug/
+data/
+fara-ds-viz-debug/
+
