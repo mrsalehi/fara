@@ -48,6 +48,12 @@ ALLOWED_DOMAINS="arxiv.org" sbatch scripts/train_fara_2k.sbatch
 
 # full WebVoyager set (explicit form — same as default):
 ALLOWED_DOMAINS="google.com,wolframalpha.com,booking.com,dictionary.cambridge.org,arxiv.org,github.com,allrecipes.com,coursera.org,amazon.com,espn.com,huggingface.co,apple.com,bbc.com" sbatch scripts/train_fara_2k.sbatch
+
+-----FSDP full fine-tune (shards params + grads + optimizer across GPUs):
+LORA=0 \
+EXTRA_ARGS="--fsdp full_shard,auto_wrap --fsdp_config /gpfs/projects/raivn/reza/fara/scripts/fsdp.json" \
+WANDB_TAGS=fullft,fsdp,2k \
+sbatch scripts/train_fara_2k.sbatch
 USAGE
 
 set -euo pipefail
