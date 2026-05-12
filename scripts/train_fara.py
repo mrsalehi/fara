@@ -25,6 +25,7 @@ import logging
 import os
 import random
 import re
+import sys
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -107,7 +108,7 @@ def _extract_instruction_text(raw: Any) -> str:
             return s
     else:
         return str(raw)
-    for key in ("high_level", "instruction", "task", "goal"):
+    for key in ("high_level", "instruction", "low_level", "task", "goal"):
         v = d.get(key)
         if isinstance(v, str) and v.strip():
             return v.strip()
@@ -1030,6 +1031,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--shuffle_seed", type=int, default=42,
                    help="Seed for shuffling the dataset before max_samples / "
                         "train-val split. Set to a negative value to disable.")
+    p.add_argument("--viz_dir", type=str, default=None,
+                   help="If set, after build_dataset finishes, dump up to "
+                        "--viz_max_rows post-processed rows to "
+                        "<viz_dir>/build_dataset_sample.html for sanity checking.")
+    p.add_argument("--viz_max_rows", type=int, default=50,
+                   help="Number of rows to include in the build-time viz dump.")
     p.add_argument("--val_split_ratio", type=float, default=0.0,
                    help="Fraction of the dataset to hold out as a validation set "
                         "(e.g., 0.02). 0 disables validation.")
@@ -1275,6 +1282,15 @@ def build_dataset(args: argparse.Namespace, processor: Qwen2_5_VLProcessor):
             "All trajectories were dropped due to unmapped actions. "
             "Check _format_assistant_message and the dataset's action vocabulary."
         )
+
+    if getattr(args, "viz_dir", None) and is_main_process():
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from visualize_trajectories import render_messages_dataset
+        n_viz = min(args.viz_max_rows, len(ds))
+        run_name = os.path.basename(os.path.normpath(args.output_dir)) or "run"
+        out_path = os.path.join(args.viz_dir, f"{run_name}_build_dataset_sample.html")
+        render_messages_dataset(ds.select(range(n_viz)), out_path)
+        log(f"[fara-train] wrote post-build viz ({n_viz} rows): {out_path}")
 
     return ds
 
