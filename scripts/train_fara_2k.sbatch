@@ -38,6 +38,16 @@ WANDB_RUN_NAME=fara-sft-2k-lora-singlescale \
 WANDB_TAGS=lora,singlescale,2k \
 OUTPUT_DIR=/gpfs/projects/raivn/reza/fara/results/fara_sft_2k_singlescale \
 sbatch scripts/train_fara_2k.sbatch
+
+-----Domain presets (default = full WebVoyager set; override via ALLOWED_DOMAINS):
+# arxiv + allrecipes only:
+ALLOWED_DOMAINS="arxiv.org,allrecipes.com" sbatch scripts/train_fara_2k.sbatch
+
+# arxiv only:
+ALLOWED_DOMAINS="arxiv.org" sbatch scripts/train_fara_2k.sbatch
+
+# full WebVoyager set (explicit form — same as default):
+ALLOWED_DOMAINS="google.com,wolframalpha.com,booking.com,dictionary.cambridge.org,arxiv.org,github.com,allrecipes.com,coursera.org,amazon.com,espn.com,huggingface.co,apple.com,bbc.com" sbatch scripts/train_fara_2k.sbatch
 USAGE
 
 set -euo pipefail
@@ -130,7 +140,7 @@ accelerate launch \
     --data_path "$DATA_PATH" \
     --model_id "$MODEL_ID" \
     --output_dir "$OUTPUT_DIR" \
-    --per_device_batch_size ${PER_DEVICE_BATCH_SIZE:1} \
+    --per_device_batch_size ${PER_DEVICE_BATCH_SIZE:-1} \
     --gradient_accumulation_steps 8 \
     --learning_rate ${LEARNING_RATE:-1e-5} \
     --num_epochs ${EPOCHS:-1} \
@@ -145,9 +155,10 @@ accelerate launch \
     --bf16 \
     --gradient_checkpointing \
     --attn_implementation sdpa \
-    --allowed_domains arxiv.org,allrecipes.com \
+    --allowed_domains "${ALLOWED_DOMAINS:-google.com,wolframalpha.com,booking.com,dictionary.cambridge.org,arxiv.org,github.com,allrecipes.com,coursera.org,amazon.com,espn.com,huggingface.co,apple.com,bbc.com}" \
     ${LORA_FLAG} \
     --report_to wandb \
+    --domain_filter_mode ${DOMAIN_FILTER_MODE:-strict} \
     --wandb_entity mrsalehi \
     --wandb_project fara-multiscale \
     --wandb_run_name "$WANDB_RUN_NAME" \
