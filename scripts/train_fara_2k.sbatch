@@ -24,6 +24,9 @@ MAX_SAMPLES=2000                           # cap dataset; unset = use all
 VAL_SPLIT_RATIO=0.1                        # hold out 10% for validation
 VAL_MAX_SAMPLES=500                        # optional cap on val set
 EVAL_STEPS=200                             # how often to run eval (default 500)
+INF_EVAL_SAMPLES=4                         # generations logged to wandb each eval (0/unset = off)
+INF_EVAL_MAX_NEW_TOKENS=256                # max new tokens per inference-eval sample
+INF_EVAL_SEED=0                            # seed for inference-eval sample selection
 SAMPLING_STRATEGY=full_trajectory          # or decision_point
 WANDB_RUN_NAME=fara-sft-2k-lora-singlescale
 WANDB_TAGS=lora,singlescale,2k
@@ -100,6 +103,15 @@ if [[ -n "${VAL_SPLIT_RATIO:-}" ]]; then
   VAL_FLAGS+=" --eval_steps ${EVAL_STEPS:-128}"
 fi
 
+# Optional inference-eval viz (logs generations to wandb under eval/inf/samples).
+# Only enabled when a val split exists; mirrors FARA_TRAIN_ACCELERATE in launch.json.
+INF_EVAL_FLAGS=""
+if [[ -n "${VAL_SPLIT_RATIO:-}" && -n "${INF_EVAL_SAMPLES:-}" && "${INF_EVAL_SAMPLES}" != "0" ]]; then
+  INF_EVAL_FLAGS="--inf_eval_samples ${INF_EVAL_SAMPLES}"
+  INF_EVAL_FLAGS+=" --inf_eval_max_new_tokens ${INF_EVAL_MAX_NEW_TOKENS:-256}"
+  INF_EVAL_FLAGS+=" --inf_eval_seed ${INF_EVAL_SEED:-0}"
+fi
+
 # Optional vision-encoder LR override. VISION_LEARNING_RATE wins over VISION_LR_RATIO.
 VISION_LR_FLAGS=""
 [[ -n "${VISION_LEARNING_RATE:-}" ]] && VISION_LR_FLAGS+=" --vision_learning_rate ${VISION_LEARNING_RATE}"
@@ -156,6 +168,7 @@ accelerate launch \
     --save_total_limit ${SAVE_TOTAL_LIMIT:-3} \
     ${MAX_SAMPLES_FLAG} \
     ${VAL_FLAGS} \
+    ${INF_EVAL_FLAGS} \
     ${VISION_LR_FLAGS} \
     --sampling_strategy ${SAMPLING_STRATEGY:-full_trajectory} \
     --bf16 \
