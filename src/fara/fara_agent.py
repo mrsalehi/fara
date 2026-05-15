@@ -568,6 +568,22 @@ class FaraAgent:
         function_call = [FunctionCall(id="dummy", **action)]
         return function_call, message
 
+    def _annotate_screenshot(self, path: str, coord, action: str) -> None:
+        if not os.path.exists(path):
+            return
+        from PIL import ImageDraw
+
+        img = Image.open(path).convert("RGB")
+        draw = ImageDraw.Draw(img)
+        x, y = coord
+        r = 12
+        draw.ellipse((x - r, y - r, x + r, y + r), outline="red", width=4)
+        draw.line((x - r - 6, y, x + r + 6, y), fill="red", width=2)
+        draw.line((x, y - r - 6, x, y + r + 6), fill="red", width=2)
+        draw.text((x + r + 6, y + r + 6), action, fill="red")
+        out = path.replace(".png", "_annotated.png")
+        img.save(out)
+
     async def execute_action(
         self,
         function_call: List[FunctionCall],
@@ -576,7 +592,7 @@ class FaraAgent:
         args = function_call[0].arguments
         action_description = ""
         assert self._page is not None
-        self.logger.debug(
+        self.logger.info(
             WebSurferEvent(
                 source="FaraAgent",
                 url=await self._playwright_controller.get_page_url(self._page),
@@ -593,6 +609,14 @@ class FaraAgent:
                 self.viewport_width,
                 self.viewport_height,
             )
+            if self.save_screenshots:
+                self._annotate_screenshot(
+                    os.path.join(
+                        self.downloads_folder, f"screenshot{self._num_actions}.png"
+                    ),
+                    args["coordinate"],
+                    args["action"],
+                )
 
         is_stop_action = False
 
