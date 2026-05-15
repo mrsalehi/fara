@@ -40,6 +40,7 @@ import torch
 from datasets import load_dataset, load_from_disk
 from PIL import Image
 from transformers import Qwen2_5_VLProcessor
+from transformers.trainer_callback import TrainerCallback
 from fara.modeling.processing_qwen2_5_vl import FaraProcessor
 
 from fara.modeling.modeling_qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
@@ -825,6 +826,229 @@ class PatchStatsSFTTrainer:
         return super().log(logs, start_time)
 
 
+_COORD_RE = re.compile(r'"coordinate"\s*:\s*\[\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\]')
+
+
+def _extract_coord(text: str) -> Optional[List[float]]:
+    if not isinstance(text, str):
+        return None
+    m = _COORD_RE.search(text)
+    if not m:
+        return None
+    return [float(m.group(1)), float(m.group(2))]
+
+
+def _last_assistant_text(messages: List[Dict[str, Any]]) -> str:
+    for msg in reversed(messages):
+        if msg.get("role") == "assistant":
+            parts = msg.get("content", [])
+            if isinstance(parts, list):
+                for c in parts:
+                    if isinstance(c, dict) and c.get("type") == "text":
+                        return c.get("text", "")
+            if isinstance(parts, str):
+                return parts
+    return ""
+
+
+def _first_user_text(messages: List[Dict[str, Any]]) -> str:
+    for msg in messages:
+        if msg.get("role") == "user":
+            parts = msg.get("content", [])
+            if isinstance(parts, list):
+                for c in parts:
+                    if isinstance(c, dict) and c.get("type") == "text":
+                        return c.get("text", "")
+            if isinstance(parts, str):
+                return parts
+    return ""
+
+
+_ACTION_RE = re.compile(r'"action"\s*:\s*"([^"]+)"')
+
+
+def _extract_action(text: str) -> Optional[str]:
+    m = _ACTION_RE.search(text)
+    return m.group(1) if m else None
+
+
+def _render_coord_image(
+    image: "Image.Image",
+    pred: Optional[List[float]],
+    gt: Optional[List[float]],
+) -> "Image.Image":
+    from PIL import ImageDraw
+
+    img = image.convert("RGB").copy()
+    draw = ImageDraw.Draw(img)
+    r = 12
+    if gt is not None:
+        x, y = gt
+        draw.ellipse((x - r, y - r, x + r, y + r), outline="lime", width=4)
+        draw.text((x + r + 4, y + r + 4), "gt", fill="lime")
+    if pred is not None:
+        x, y = pred
+        draw.ellipse((x - r, y - r, x + r, y + r), outline="red", width=4)
+        draw.line((x - r - 6, y, x + r + 6, y), fill="red", width=2)
+        draw.line((x, y - r - 6, x, y + r + 6), fill="red", width=2)
+        draw.text((x + r + 4, y - r - 14), "pred", fill="red")
+    return img
+
+
+class InferenceEvalCallback(TrainerCallback):
+    """On each eval cycle, run model.generate on a fixed random subset of the
+    val set and log the screenshots (with predicted vs ground-truth coords
+    overlaid when present) to wandb.
+
+    Same indices each eval -> easy to track per-sample evolution over time.
+    """
+
+    def __init__(
+        self,
+        eval_hf_dataset: Any,
+        processor: Any,
+        n_samples: int,
+        max_n_images: int,
+        max_new_tokens: int,
+        seed: int,
+    ) -> None:
+        self.dataset = eval_hf_dataset
+        self.processor = processor
+        self.max_n_images = max_n_images
+        self.max_new_tokens = max_new_tokens
+        n = min(n_samples, len(eval_hf_dataset))
+        rng = random.Random(seed)
+        self.indices = rng.sample(range(len(eval_hf_dataset)), n) if n > 0 else []
+
+    MAX_TURNS_PER_ROW = 10
+
+    def _iter_turn_inputs(self, row: Dict[str, Any]):
+        """For each decision point t in [0, min(n_turns, MAX_TURNS_PER_ROW)),
+        yield (enc, last_screenshot, gt_text, t). The prompt ends with the
+        assistant header so model.generate has to emit the next turn.
+        """
+        messages_full = row["messages"]
+        pil_images_full = [_decode_image(img) for img in row["images"]]
+        n_turns = (len(messages_full) - 1) // 2
+        if n_turns <= 0:
+            return
+        n = min(n_turns, self.MAX_TURNS_PER_ROW)
+        for t in range(n):
+            messages, pil_images = _truncate_to_decision_point(
+                messages_full, pil_images_full, t, max_n_images=self.max_n_images,
+            )
+            if not messages or messages[-1].get("role") != "assistant":
+                continue
+            if not pil_images:
+                continue
+            gt_text = _last_assistant_text(messages)
+            prompt_messages = messages[:-1]
+            enc = self.processor(
+                messages=prompt_messages,
+                images=pil_images,
+                add_generation_prompt=True,
+                padding=False,
+                truncation=False,
+                return_tensors="pt",
+            )
+            yield enc, pil_images[-1], gt_text, t
+
+    def on_evaluate(self, args, state, control, model=None, **kwargs):
+        if not self.indices:
+            return
+        try:
+            import wandb
+        except ImportError:
+            return
+        # if not is_main_process() or wandb.run is None:
+            # return
+        if is_main_process() and wandb.run is not None:
+            device = next(model.parameters()).device
+            was_training = model.training
+            model.eval()
+            import base64, html as _html
+            from io import BytesIO
+            task_sections: List[str] = []
+            try:
+                for idx in self.indices:
+                    row = self.dataset[idx]
+                    task_text = _first_user_text(row["messages"])
+                    turn_blocks: List[str] = []
+                    for enc, last_screenshot, gt_text, t in self._iter_turn_inputs(row):
+                        inputs = {k: v.to(device) for k, v in enc.items()
+                                if torch.is_tensor(v)}
+                        with torch.no_grad():
+                            out = model.generate(
+                                **inputs,
+                                max_new_tokens=self.max_new_tokens,
+                                do_sample=False,
+                                pad_token_id=self.processor.tokenizer.pad_token_id
+                                    or self.processor.tokenizer.eos_token_id,
+                            )
+                        prompt_len = inputs["input_ids"].shape[1]
+                        pred_text = self.processor.tokenizer.decode(
+                            out[0, prompt_len:], skip_special_tokens=True,
+                        )
+                        pred_coord = _extract_coord(pred_text)
+                        gt_coord = _extract_coord(gt_text)
+                        pred_action = _extract_action(pred_text)
+                        gt_action = _extract_action(gt_text)
+
+                        rendered = _render_coord_image(last_screenshot, pred_coord, gt_coord)
+                        buf = BytesIO()
+                        rendered.save(buf, format="JPEG", quality=85)
+                        b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+                        turn_blocks.append(
+                            f'<div style="display:flex;gap:12px;margin:12px 0;'
+                            f'border-bottom:1px dashed #bbb;padding-bottom:12px;">'
+                            f'<img src="data:image/jpeg;base64,{b64}" '
+                            f'style="max-width:50%;height:auto;object-fit:contain;"/>'
+                            f'<div style="flex:1;font-family:monospace;font-size:12px;">'
+                            f'<div><b>turn={t} step={state.global_step}</b></div>'
+                            f'<div>pred_action={pred_action} pred_coord={pred_coord}</div>'
+                            f'<div>gt_action={gt_action} gt_coord={gt_coord}</div>'
+                            f'<details open><summary><b>PRED</b></summary>'
+                            f'<pre style="white-space:pre-wrap;">{_html.escape(pred_text)}</pre></details>'
+                            f'<details><summary><b>GT</b></summary>'
+                            f'<pre style="white-space:pre-wrap;">{_html.escape(gt_text)}</pre></details>'
+                            f'</div></div>'
+                        )
+                    if turn_blocks:
+                        task_sections.append(
+                            f'<section style="border:3px solid #333;border-radius:8px;'
+                            f'background:#fff;padding:16px;margin:32px 0;">'
+                            f'<h2 style="margin:0 0 8px 0;padding:8px 12px;'
+                            f'background:#333;color:#fff;border-radius:4px;">'
+                            f'TASK idx={idx}</h2>'
+                            f'<div style="background:#eef;padding:10px 12px;border-radius:4px;'
+                            f'margin:0 0 12px 0;font-family:monospace;font-size:13px;'
+                            f'white-space:pre-wrap;">'
+                            f'<b>User instruction:</b><br/>{_html.escape(task_text)}</div>'
+                            + "".join(turn_blocks) +
+                            f'</section>'
+                        )
+            finally:
+                if was_training:
+                    model.train()
+
+            if task_sections:
+                separator = (
+                    '<hr style="border:0;border-top:6px double #000;margin:40px 0;"/>'
+                )
+                page = (
+                    f'<html><body style="background:#fafafa;">'
+                    f'<h3>Inference eval @ step {state.global_step}</h3>'
+                    + separator.join(task_sections) +
+                    f'</body></html>'
+                )
+                wandb.log(
+                    {"eval/inf/samples": wandb.Html(page)},
+                    step=wandb.run.step,
+                )
+ 
+        torch.distributed.barrier() if torch.distributed.is_available() and torch.distributed.is_initialized() else None
+
+
 class FaraDataset(torch.utils.data.Dataset):
     """Per-sample processing runs here (in DataLoader workers).
     Returns fully tokenized tensors so the collator only pads/stacks.
@@ -1048,6 +1272,14 @@ def parse_args() -> argparse.Namespace:
                    help="Run eval every N steps (only when val set is enabled).")
     p.add_argument("--per_device_eval_batch_size", type=int, default=None,
                    help="Per-device eval batch size. Defaults to per_device_batch_size.")
+    p.add_argument("--inf_eval_samples", type=int, default=16,
+                   help="Number of random val samples to run inference on per eval "
+                        "cycle. 0 disables. Logged to wandb under eval/inf/.")
+    p.add_argument("--inf_eval_seed", type=int, default=0,
+                   help="Seed for the fixed random subset used by inference eval, so "
+                        "the same samples are compared across eval steps.")
+    p.add_argument("--inf_eval_max_new_tokens", type=int, default=192,
+                   help="max_new_tokens for inference eval generation.")
     p.add_argument(
         "--allowed_domains",
         default="",
@@ -1420,6 +1652,24 @@ def main() -> None:
         peft_config=lora_config,
     )
     trainer._init_patch_stats()
+
+    if (
+        eval_hf_dataset is not None
+        and "wandb" in report_to
+        and args.inf_eval_samples > 0
+    ):
+        trainer.add_callback(
+            InferenceEvalCallback(
+                eval_hf_dataset=eval_hf_dataset,
+                processor=processor,
+                n_samples=args.inf_eval_samples,
+                max_n_images=args.max_n_images_train,
+                max_new_tokens=args.inf_eval_max_new_tokens,
+                seed=args.inf_eval_seed,
+            )
+        )
+        log(f"[fara-train] inference eval callback: {args.inf_eval_samples} "
+            f"samples per eval (seed={args.inf_eval_seed})")
 
     trainer.train()
 
