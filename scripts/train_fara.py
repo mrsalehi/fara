@@ -960,92 +960,94 @@ class InferenceEvalCallback(TrainerCallback):
             import wandb
         except ImportError:
             return
-        # if not is_main_process() or wandb.run is None:
-            # return
-        if is_main_process() and wandb.run is not None:
-            device = next(model.parameters()).device
-            was_training = model.training
-            model.eval()
-            import base64, html as _html
-            from io import BytesIO
-            task_sections: List[str] = []
-            try:
-                for idx in self.indices:
-                    row = self.dataset[idx]
-                    task_text = _first_user_text(row["messages"])
-                    turn_blocks: List[str] = []
-                    for enc, last_screenshot, gt_text, t in self._iter_turn_inputs(row):
-                        inputs = {k: v.to(device) for k, v in enc.items()
-                                if torch.is_tensor(v)}
-                        with torch.no_grad():
-                            out = model.generate(
-                                **inputs,
-                                max_new_tokens=self.max_new_tokens,
-                                do_sample=False,
-                                pad_token_id=self.processor.tokenizer.pad_token_id
-                                    or self.processor.tokenizer.eos_token_id,
-                            )
-                        prompt_len = inputs["input_ids"].shape[1]
-                        pred_text = self.processor.tokenizer.decode(
-                            out[0, prompt_len:], skip_special_tokens=True,
+        # Under FSDP FULL_SHARD, every rank must participate in model.generate()
+        # so the per-layer all-gathers can complete; only rank 0 logs to wandb.
+        is_main = is_main_process() and wandb.run is not None
+        device = next(model.parameters()).device
+        was_training = model.training
+        model.eval()
+        import base64, html as _html
+        from io import BytesIO
+        task_sections: List[str] = []
+        try:
+            for idx in self.indices:
+                row = self.dataset[idx]
+                task_text = _first_user_text(row["messages"])
+                turn_blocks: List[str] = []
+                for enc, last_screenshot, gt_text, t in self._iter_turn_inputs(row):
+                    inputs = {k: v.to(device) for k, v in enc.items()
+                            if torch.is_tensor(v)}
+                    with torch.no_grad():
+                        out = model.generate(
+                            **inputs,
+                            max_new_tokens=self.max_new_tokens,
+                            do_sample=False,
+                            pad_token_id=self.processor.tokenizer.pad_token_id
+                                or self.processor.tokenizer.eos_token_id,
                         )
-                        pred_coord = _extract_coord(pred_text)
-                        gt_coord = _extract_coord(gt_text)
-                        pred_action = _extract_action(pred_text)
-                        gt_action = _extract_action(gt_text)
+                    if not is_main:
+                        continue
+                    prompt_len = inputs["input_ids"].shape[1]
+                    pred_text = self.processor.tokenizer.decode(
+                        out[0, prompt_len:], skip_special_tokens=True,
+                    )
+                    pred_coord = _extract_coord(pred_text)
+                    gt_coord = _extract_coord(gt_text)
+                    pred_action = _extract_action(pred_text)
+                    gt_action = _extract_action(gt_text)
 
-                        rendered = _render_coord_image(last_screenshot, pred_coord, gt_coord)
-                        buf = BytesIO()
-                        rendered.save(buf, format="JPEG", quality=85)
-                        b64 = base64.b64encode(buf.getvalue()).decode("ascii")
-                        turn_blocks.append(
-                            f'<div style="display:flex;gap:12px;margin:12px 0;'
-                            f'border-bottom:1px dashed #bbb;padding-bottom:12px;">'
-                            f'<img src="data:image/jpeg;base64,{b64}" '
-                            f'style="max-width:50%;height:auto;object-fit:contain;"/>'
-                            f'<div style="flex:1;font-family:monospace;font-size:12px;">'
-                            f'<div><b>turn={t} step={state.global_step}</b></div>'
-                            f'<div>pred_action={pred_action} pred_coord={pred_coord}</div>'
-                            f'<div>gt_action={gt_action} gt_coord={gt_coord}</div>'
-                            f'<details open><summary><b>PRED</b></summary>'
-                            f'<pre style="white-space:pre-wrap;">{_html.escape(pred_text)}</pre></details>'
-                            f'<details><summary><b>GT</b></summary>'
-                            f'<pre style="white-space:pre-wrap;">{_html.escape(gt_text)}</pre></details>'
-                            f'</div></div>'
-                        )
-                    if turn_blocks:
-                        task_sections.append(
-                            f'<section style="border:3px solid #333;border-radius:8px;'
-                            f'background:#fff;padding:16px;margin:32px 0;">'
-                            f'<h2 style="margin:0 0 8px 0;padding:8px 12px;'
-                            f'background:#333;color:#fff;border-radius:4px;">'
-                            f'TASK idx={idx}</h2>'
-                            f'<div style="background:#eef;padding:10px 12px;border-radius:4px;'
-                            f'margin:0 0 12px 0;font-family:monospace;font-size:13px;'
-                            f'white-space:pre-wrap;">'
-                            f'<b>User instruction:</b><br/>{_html.escape(task_text)}</div>'
-                            + "".join(turn_blocks) +
-                            f'</section>'
-                        )
-            finally:
-                if was_training:
-                    model.train()
+                    rendered = _render_coord_image(last_screenshot, pred_coord, gt_coord)
+                    buf = BytesIO()
+                    rendered.save(buf, format="JPEG", quality=85)
+                    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+                    turn_blocks.append(
+                        f'<div style="display:flex;gap:12px;margin:12px 0;'
+                        f'border-bottom:1px dashed #bbb;padding-bottom:12px;">'
+                        f'<img src="data:image/jpeg;base64,{b64}" '
+                        f'style="max-width:50%;height:auto;object-fit:contain;"/>'
+                        f'<div style="flex:1;font-family:monospace;font-size:12px;">'
+                        f'<div><b>turn={t} step={state.global_step}</b></div>'
+                        f'<div>pred_action={pred_action} pred_coord={pred_coord}</div>'
+                        f'<div>gt_action={gt_action} gt_coord={gt_coord}</div>'
+                        f'<details open><summary><b>PRED</b></summary>'
+                        f'<pre style="white-space:pre-wrap;">{_html.escape(pred_text)}</pre></details>'
+                        f'<details><summary><b>GT</b></summary>'
+                        f'<pre style="white-space:pre-wrap;">{_html.escape(gt_text)}</pre></details>'
+                        f'</div></div>'
+                    )
+                if is_main and turn_blocks:
+                    task_sections.append(
+                        f'<section style="border:3px solid #333;border-radius:8px;'
+                        f'background:#fff;padding:16px;margin:32px 0;">'
+                        f'<h2 style="margin:0 0 8px 0;padding:8px 12px;'
+                        f'background:#333;color:#fff;border-radius:4px;">'
+                        f'TASK idx={idx}</h2>'
+                        f'<div style="background:#eef;padding:10px 12px;border-radius:4px;'
+                        f'margin:0 0 12px 0;font-family:monospace;font-size:13px;'
+                        f'white-space:pre-wrap;">'
+                        f'<b>User instruction:</b><br/>{_html.escape(task_text)}</div>'
+                        + "".join(turn_blocks) +
+                        f'</section>'
+                    )
+        finally:
+            if was_training:
+                model.train()
 
-            if task_sections:
-                separator = (
-                    '<hr style="border:0;border-top:6px double #000;margin:40px 0;"/>'
-                )
-                page = (
-                    f'<html><body style="background:#fafafa;">'
-                    f'<h3>Inference eval @ step {state.global_step}</h3>'
-                    + separator.join(task_sections) +
-                    f'</body></html>'
-                )
-                wandb.log(
-                    {"eval/inf/samples": wandb.Html(page)},
-                    step=wandb.run.step,
-                )
- 
+        if is_main and task_sections:
+            separator = (
+                '<hr style="border:0;border-top:6px double #000;margin:40px 0;"/>'
+            )
+            page = (
+                f'<html><body style="background:#fafafa;">'
+                f'<h3>Inference eval @ step {state.global_step}</h3>'
+                + separator.join(task_sections) +
+                f'</body></html>'
+            )
+            wandb.log(
+                {"eval/inf/samples": wandb.Html(page)},
+                step=wandb.run.step,
+            )
+
         torch.distributed.barrier() if torch.distributed.is_available() and torch.distributed.is_initialized() else None
 
 
