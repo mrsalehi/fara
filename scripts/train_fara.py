@@ -748,6 +748,107 @@ def _count_final_tokens(image_grid_thw: Any, merge_size: int) -> int:
     return total
 
 
+def _orthogonalize_newton_schulz(g: torch.Tensor, steps: int, eps: float = 1e-7) -> torch.Tensor:
+    """Muon's matrix update: approximate the polar factor of a gradient."""
+    orig_shape = g.shape
+    x = g.reshape(g.shape[0], -1).float()
+    transposed = x.shape[0] > x.shape[1]
+    if transposed:
+        x = x.T
+
+    x = x / (x.norm() + eps)
+    a, b, c = 3.4445, -4.7750, 2.0315
+    for _ in range(steps):
+        xx_t = x @ x.T
+        x = a * x + (b * xx_t + c * (xx_t @ xx_t)) @ x
+
+    if transposed:
+        x = x.T
+    return x.reshape(orig_shape).to(dtype=g.dtype)
+
+
+class FaraMuonOptimizer(torch.optim.Optimizer):
+    """Muon for matrix-like params, AdamW fallback for vectors/biases/embeddings."""
+
+    def __init__(
+        self,
+        params,
+        adamw_betas=(0.9, 0.95),
+        adamw_eps: float = 1e-8,
+        muon_momentum: float = 0.95,
+        muon_ns_steps: int = 5,
+    ):
+        defaults = dict(
+            adamw_betas=adamw_betas,
+            adamw_eps=adamw_eps,
+            muon_momentum=muon_momentum,
+            muon_ns_steps=muon_ns_steps,
+        )
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            lr = group["lr"]
+            weight_decay = group.get("weight_decay", 0.0)
+            use_muon = group.get("use_muon", False)
+
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                grad = p.grad
+                if grad.is_sparse:
+                    raise RuntimeError("FaraMuonOptimizer does not support sparse gradients")
+
+                if use_muon:
+                    if weight_decay:
+                        p.mul_(1.0 - lr * weight_decay)
+
+                    state = self.state[p]
+                    if not state:
+                        state["momentum_buffer"] = torch.zeros_like(p)
+                    buf = state["momentum_buffer"]
+                    momentum = group["muon_momentum"]
+                    buf.mul_(momentum).add_(grad)
+                    update = _orthogonalize_newton_schulz(buf, group["muon_ns_steps"])
+
+                    flat_rows = update.reshape(update.shape[0], -1).shape[0]
+                    flat_cols = update.reshape(update.shape[0], -1).shape[1]
+                    scale = max(1.0, flat_rows / flat_cols) ** 0.5
+                    p.add_(update, alpha=-lr * scale)
+                    continue
+
+                beta1, beta2 = group["adamw_betas"]
+                eps = group["adamw_eps"]
+                state = self.state[p]
+                if not state:
+                    state["step"] = 0
+                    state["exp_avg"] = torch.zeros_like(p)
+                    state["exp_avg_sq"] = torch.zeros_like(p)
+
+                exp_avg = state["exp_avg"]
+                exp_avg_sq = state["exp_avg_sq"]
+                state["step"] += 1
+
+                if weight_decay:
+                    p.mul_(1.0 - lr * weight_decay)
+                exp_avg.mul_(beta1).add_(grad, alpha=1.0 - beta1)
+                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
+
+                bias_correction1 = 1.0 - beta1 ** state["step"]
+                bias_correction2 = 1.0 - beta2 ** state["step"]
+                step_size = lr * (bias_correction2 ** 0.5) / bias_correction1
+                denom = exp_avg_sq.sqrt().add_(eps)
+                p.addcdiv_(exp_avg, denom, value=-step_size)
+
+        return loss
+
+
 class PatchStatsSFTTrainer:
     def _init_patch_stats(self) -> None:
         self._patch_baseline_tokens = 0
@@ -765,19 +866,40 @@ class PatchStatsSFTTrainer:
 
         from transformers import Trainer
         decay_names = set(self.get_decay_parameter_names(self.model))
+        optimizer_name = getattr(self.args, "fara_optimizer", "adamw_torch")
 
         def is_vision(name: str) -> bool:
             return name.startswith("visual.") or ".visual." in name
 
+        def is_muon_param(name: str, param: torch.nn.Parameter, decays: bool) -> bool:
+            if optimizer_name != "muon":
+                return False
+            lname = name.lower()
+            if not decays or param.ndim < 2:
+                return False
+            if any(part in lname for part in ("embed", "embedding", "lm_head")):
+                return False
+            return True
+
         groups = {
-            ("vision", True):  {"params": [], "lr": self.args.vision_learning_rate,
-                                "weight_decay": self.args.weight_decay},
-            ("vision", False): {"params": [], "lr": self.args.vision_learning_rate,
-                                "weight_decay": 0.0},
-            ("llm", True):     {"params": [], "lr": self.args.learning_rate,
-                                "weight_decay": self.args.weight_decay},
-            ("llm", False):    {"params": [], "lr": self.args.learning_rate,
-                                "weight_decay": 0.0},
+            ("vision", True, True):  {"params": [], "lr": self.args.vision_learning_rate,
+                                      "weight_decay": self.args.weight_decay,
+                                      "use_muon": True},
+            ("vision", True, False): {"params": [], "lr": self.args.vision_learning_rate,
+                                      "weight_decay": self.args.weight_decay,
+                                      "use_muon": False},
+            ("vision", False, False): {"params": [], "lr": self.args.vision_learning_rate,
+                                       "weight_decay": 0.0,
+                                       "use_muon": False},
+            ("llm", True, True):     {"params": [], "lr": self.args.learning_rate,
+                                      "weight_decay": self.args.weight_decay,
+                                      "use_muon": True},
+            ("llm", True, False):    {"params": [], "lr": self.args.learning_rate,
+                                      "weight_decay": self.args.weight_decay,
+                                      "use_muon": False},
+            ("llm", False, False):   {"params": [], "lr": self.args.learning_rate,
+                                      "weight_decay": 0.0,
+                                      "use_muon": False},
         }
 
         for n, p in self.model.named_parameters():
@@ -785,18 +907,32 @@ class PatchStatsSFTTrainer:
                 continue
             kind = "vision" if is_vision(n) else "llm"
             decays = n in decay_names
-            groups[(kind, decays)]["params"].append(p)
+            use_muon = is_muon_param(n, p, decays)
+            groups[(kind, decays, use_muon)]["params"].append(p)
         
         param_groups = [g for g in groups.values() if g["params"]]
-        optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args)
-        optimizer_kwargs.pop("lr", None)
-        self.optimizer = optimizer_cls(param_groups, **optimizer_kwargs)
+        if optimizer_name == "muon":
+            self.optimizer = FaraMuonOptimizer(
+                param_groups,
+                adamw_betas=(getattr(self.args, "muon_adamw_beta1", 0.9),
+                             getattr(self.args, "muon_adamw_beta2", 0.95)),
+                adamw_eps=getattr(self.args, "muon_adamw_eps", 1e-8),
+                muon_momentum=getattr(self.args, "muon_momentum", 0.95),
+                muon_ns_steps=getattr(self.args, "muon_ns_steps", 5),
+            )
+        else:
+            optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args)
+            optimizer_kwargs.pop("lr", None)
+            self.optimizer = optimizer_cls(param_groups, **optimizer_kwargs)
 
         # Optional: log group sizes once
         if is_main_process():
+            log(f"[fara-train] optimizer={optimizer_name}")
             for g in param_groups:
                 n_params = sum(p.numel() for p in g["params"])
-                log(f"[fara-train] optim group lr={g['lr']:.2e} wd={g['weight_decay']} params={n_params:,}")
+                opt_kind = "muon" if g.get("use_muon") else "adamw"
+                log(f"[fara-train] optim group kind={opt_kind} lr={g['lr']:.2e} "
+                    f"wd={g['weight_decay']} params={n_params:,}")
 
             # Warn when vision LR was set but no trainable vision params exist
             # (e.g., default LoRA only injects into LLM attn modules, or --freeze_vision).
@@ -1347,6 +1483,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--gradient_accumulation_steps", type=int, default=8)
     p.add_argument("--learning_rate", type=float, default=1e-5,
                    help="Base LR (used for LLM params).")
+    p.add_argument("--optimizer", choices=["adamw_torch", "muon"], default="adamw_torch",
+                   help="Optimizer for trainable params. Muon is applied to "
+                        "matrix-like weight params, with AdamW fallback for "
+                        "vectors/biases/embeddings.")
+    p.add_argument("--muon_momentum", type=float, default=0.95)
+    p.add_argument("--muon_ns_steps", type=int, default=5,
+                   help="Newton-Schulz iterations for Muon orthogonalization.")
+    p.add_argument("--muon_adamw_beta1", type=float, default=0.9,
+                   help="AdamW beta1 for params not handled by Muon.")
+    p.add_argument("--muon_adamw_beta2", type=float, default=0.95,
+                   help="AdamW beta2 for params not handled by Muon.")
+    p.add_argument("--muon_adamw_eps", type=float, default=1e-8,
+                   help="AdamW epsilon for params not handled by Muon.")
     p.add_argument("--vision_learning_rate", type=float, default=None,
                    help="LR for vision-encoder params (visual.*). "
                         "Overrides --vision_lr_ratio when set.")
@@ -1773,6 +1922,12 @@ def main() -> None:
         train_args.vision_learning_rate = args.learning_rate * args.vision_lr_ratio
     log(f"[fara-train] LLM lr={args.learning_rate:.2e} | "
         f"vision lr={train_args.vision_learning_rate:.2e}")
+    train_args.fara_optimizer = args.optimizer
+    train_args.muon_momentum = args.muon_momentum
+    train_args.muon_ns_steps = args.muon_ns_steps
+    train_args.muon_adamw_beta1 = args.muon_adamw_beta1
+    train_args.muon_adamw_beta2 = args.muon_adamw_beta2
+    train_args.muon_adamw_eps = args.muon_adamw_eps
 
     class PatchStatsTrainer(PatchStatsSFTTrainer, SFTTrainer):
         pass

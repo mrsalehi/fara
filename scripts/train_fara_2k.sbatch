@@ -20,6 +20,7 @@ NUM_GPUS=8                                 # default: torch.cuda.device_count()
 DATA_PATH=/path/to/file.parquet
 MODEL_ID=microsoft/Fara-7B
 OUTPUT_DIR=/path/to/run                    # default: results/fara_sft_2k_<jobid>
+OPTIMIZER=adamw_torch                      # or muon
 MAX_SAMPLES=2000                           # cap dataset; unset = use all
 VAL_SPLIT_RATIO=0.1                        # hold out 10% for validation
 VAL_MAX_SAMPLES=500                        # optional cap on val set
@@ -131,6 +132,7 @@ else
 fi
 _TAGS+=("ep${EPOCHS:-1}")
 _TAGS+=("lr${LEARNING_RATE:-1e-5}")
+_TAGS+=("${OPTIMIZER:-adamw_torch}")
 _TAGS+=("${SAMPLING_STRATEGY:-none}")
 _TAGS+=("max${MAX_TRAJECTORY_TURNS:-16}turns")
 [[ -n "${VAL_SPLIT_RATIO:-}" ]] && _TAGS+=("val${VAL_SPLIT_RATIO}")
@@ -167,6 +169,7 @@ accelerate launch \
     --per_device_batch_size ${PER_DEVICE_BATCH_SIZE:-1} \
     --gradient_accumulation_steps 8 \
     --learning_rate ${LEARNING_RATE:-1e-5} \
+    --optimizer ${OPTIMIZER:-adamw_torch} \
     --num_epochs ${EPOCHS:-1} \
     --max_seq_length ${MAX_SEQ_LENGTH:-16384} \
     --logging_steps 1 \
