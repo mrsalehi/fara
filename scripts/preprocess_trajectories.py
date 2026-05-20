@@ -131,16 +131,18 @@ def _filter_row(row: Dict[str, Any]) -> Dict[str, Any]:
     if n > 0 and float(_to_array(images[0]).astype(np.float32).var()) == 0.0:
         keep[0] = False
 
+    # NOTE: for now disabled trailing dup drop, since I think send_user truncation is more important and 
+    #       I think it covers all the trailing dup cases as far as I checked. This might change in the future.
     # Pass 3: trailing dup — last active frame pixel-equal to the prior active.
     # Skipped after a send_msg truncation: the truncated tail is the model's
     # final answer step and must always be kept.
-    if not truncated:
-        active = [i for i, k in enumerate(keep) if k]
-        if len(active) >= 2:
-            last = _to_array(images[active[-1]])
-            prev = _to_array(images[active[-2]])
-            if last.shape == prev.shape and np.array_equal(last, prev):
-                keep[active[-1]] = False
+    # if not truncated:
+    #     active = [i for i, k in enumerate(keep) if k]
+    #     if len(active) >= 2:
+    #         last = _to_array(images[active[-1]])
+    #         prev = _to_array(images[active[-2]])
+    #         if last.shape == prev.shape and np.array_equal(last, prev):
+    #             keep[active[-1]] = False
 
     # Output: images stay 0-indexed list; trajectory re-keyed to 1-indexed dict
     # so kept steps are contiguous (1, 2, … k), then JSON-serialized so the
@@ -200,6 +202,7 @@ def _process_file(
     num_proc: int,
     writer_batch_size: int,
     overwrite: bool,
+    disable_cache: bool,
 ) -> None:
     if out_path.exists() and not overwrite:
         print(f"[skip] {out_path.name}: exists (use --overwrite to redo)")
@@ -214,12 +217,14 @@ def _process_file(
         _filter_row,
         num_proc=num_proc,
         writer_batch_size=writer_batch_size,
+        load_from_cache_file=not disable_cache,
         desc=f"filter {in_path.name}",
     )
     ds = ds.filter(
         lambda r: bool(r["images"]),
         num_proc=num_proc,
         writer_batch_size=writer_batch_size,
+        load_from_cache_file=not disable_cache,
         desc=f"drop empty {in_path.name}",
     )
     n_out = len(ds)
@@ -239,7 +244,15 @@ def main():
     p.add_argument("--writer_batch_size", type=int, default=100,
                    help="Smaller values avoid pyarrow int32 offset overflow on "
                         "rows with large image payloads.")
+    p.add_argument("--max_files", type=int, default=None,
+                   help="Debug helper: process only the first N parquet files "
+                        "after sorting. Applies to both normal processing and "
+                        "--check_triple_dup.")
     p.add_argument("--overwrite", action="store_true")
+    p.add_argument("--disable_cache", action="store_true",
+                   help="Force datasets.map/filter to recompute instead of "
+                        "loading cached results. Useful for breakpoints inside "
+                        "_filter_row.")
     p.add_argument("--check_triple_dup", action="store_true",
                    help="Scan-only: report trajectories whose last 3 frames are "
                         "pixel-identical and breakpoint() on each. No output written.")
@@ -257,6 +270,16 @@ def main():
     )
     if not files:
         raise SystemExit(f"no parquet files under {in_path}")
+    if args.max_files is not None:
+        if args.max_files <= 0:
+            raise SystemExit(f"--max_files must be positive; got {args.max_files}")
+        files = files[: args.max_files]
+
+    if args.check_triple_dup:
+        print(f"scan-only over {len(files)} file(s)")
+        for f in files:
+            _scan_triple_dup(f, num_proc=args.num_proc, max_hits=args.max_hits)
+        return
 
     print(f"processing {len(files)} file(s) → {out_dir}")
     for f in files:
@@ -265,12 +288,8 @@ def main():
             num_proc=args.num_proc,
             writer_batch_size=args.writer_batch_size,
             overwrite=args.overwrite,
+            disable_cache=args.disable_cache,
         )
-    
-    if args.check_triple_dup:
-        for f in files:
-            _scan_triple_dup(f, num_proc=args.num_proc, max_hits=args.max_hits)
-        return
 
 
 if __name__ == "__main__":
