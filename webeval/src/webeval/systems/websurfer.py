@@ -152,6 +152,31 @@ class WebSurferSystem(BaseSystem):
                 start_page = "https://www.bing.com"
 
             question_text = example_data.get("question", "")
+            metadata_path = os.path.join(output_dir, "metadata.json")
+            if not os.path.exists(metadata_path):
+                with open(metadata_path, "w", encoding="utf-8") as f:
+                    json.dump(
+                        {
+                            "id": question_id,
+                            "question": question_text,
+                            "web_name": example_data.get("web_name", ""),
+                            "web": example_data.get("web", ""),
+                        },
+                        f,
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+            logger.info(
+                "task_question=%s",
+                json.dumps(
+                    {
+                        "id": question_id,
+                        "question": question_text,
+                        "web": example_data.get("web", ""),
+                    },
+                    ensure_ascii=False,
+                ),
+            )
 
             # Config for the local OpenAI-compatible server
             if not self.websurfer_client_cfg:

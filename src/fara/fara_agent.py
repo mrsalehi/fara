@@ -107,6 +107,32 @@ class FaraAgent:
         # quadtree/diff is only run on the newly-appended screenshot.
         # Reset by `reset()` at the start of every new agent run.
         self._traj_data_cache: Optional[Dict[str, Any]] = None
+        self._message_record_index = 0
+
+    def _append_message_record(
+        self,
+        role: str,
+        text: str,
+        screenshot: str | None = None,
+        is_original: bool = False,
+    ) -> None:
+        """Persist the text side of each chat turn next to the trajectory."""
+        if not self.downloads_folder:
+            return
+        path = os.path.join(self.downloads_folder, "messages.jsonl")
+        payload = {
+            "index": self._message_record_index,
+            "role": role,
+            "text": text,
+            "screenshot": screenshot,
+            "is_original": is_original,
+        }
+        self._message_record_index += 1
+        try:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        except Exception as exc:
+            self.logger.warning(f"Failed to append chat message record: {exc}")
 
     async def initialize(self) -> None:
         if self.did_initialize:
@@ -473,18 +499,25 @@ class FaraAgent:
         scaled_screenshot = await self._get_scaled_screenshot()
 
         if self.save_screenshots:
+            screenshot_name = f"screenshot{self._num_actions}.png"
             await self._playwright_controller.get_screenshot(
                 self._page,
-                path=os.path.join(
-                    self.downloads_folder, f"screenshot{self._num_actions}.png"
-                ),
+                path=os.path.join(self.downloads_folder, screenshot_name),
             )
+        else:
+            screenshot_name = None
 
         self._chat_history.append(
             UserMessage(
                 content=[ImageObj.from_pil(scaled_screenshot), user_message],
                 is_original=True,
             )
+        )
+        self._append_message_record(
+            "user",
+            user_message,
+            screenshot=screenshot_name,
+            is_original=True,
         )
 
         all_actions = []
@@ -552,6 +585,7 @@ class FaraAgent:
             )
             self._chat_history.append(curr_message)
             history.append(curr_message)
+            self._append_message_record("user", text_prompt)
 
         # Generate system message using the screenshot
         system_message, _ = self._get_system_message(screenshot_for_system)
@@ -562,6 +596,7 @@ class FaraAgent:
         message = response.content
 
         self._chat_history.append(AssistantMessage(content=message))
+        self._append_message_record("assistant", message)
         thoughts, action = self._parse_thoughts_and_action(message)
         action["arguments"]["thoughts"] = thoughts
 
