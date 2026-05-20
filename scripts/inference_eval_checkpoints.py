@@ -48,10 +48,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--allowed_domains", default="")
     p.add_argument("--domain_filter_mode", default="strict",
                    choices=["strict", "any"])
-    p.add_argument("--sampling_strategy", default="full_trajectory",
-                   choices=["full_trajectory", "decision_point"])
+    p.add_argument("--sampling_strategy", default="none",
+                   choices=["none", "full_trajectory", "decision_point"])
     p.add_argument("--max_n_images_train", type=int, default=3)
     p.add_argument("--max_seq_length", type=int, default=16384)
+    p.add_argument("--max_trajectory_turns", type=int, default=None)
     p.add_argument("--max_samples", type=int, default=None)
     p.add_argument("--shuffle_seed", type=int, default=-1)
     p.add_argument("--no_multiscale", action="store_true")
