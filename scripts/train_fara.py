@@ -753,6 +753,11 @@ class PatchStatsSFTTrainer:
         self._patch_baseline_tokens = 0
         self._patch_final_tokens = 0
         self._patch_samples = 0
+        self._batch_labeled_tokens = 0
+        self._batch_seq_len_sum = 0
+        self._batch_trajectory_turns_sum = 0
+        self._batch_samples = 0
+        self._last_epoch_boundary = -1
 
     def create_optimizer(self):
         if self.optimizer is not None:
@@ -833,14 +838,44 @@ class PatchStatsSFTTrainer:
         self._patch_final_tokens += int(stats[1].item())
         self._patch_samples += int(stats[2].item())
 
+    def _accumulate_batch_stats(self, inputs: Dict[str, Any]) -> None:
+        labeled = inputs.pop("batch_labeled_tokens", None)
+        seq_len_sum = inputs.pop("batch_seq_len_sum", None)
+        turns_sum = inputs.pop("batch_trajectory_turns_sum", None)
+        samples = inputs.pop("batch_sample_count", None)
+        if labeled is None or seq_len_sum is None or turns_sum is None or samples is None:
+            return
+
+        stats = torch.tensor(
+            [
+                int(labeled.item()) if torch.is_tensor(labeled) else int(labeled),
+                int(seq_len_sum.item()) if torch.is_tensor(seq_len_sum) else int(seq_len_sum),
+                int(turns_sum.item()) if torch.is_tensor(turns_sum) else int(turns_sum),
+                int(samples.item()) if torch.is_tensor(samples) else int(samples),
+            ],
+            dtype=torch.long,
+        )
+
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            device = getattr(self.args, "device", torch.device("cpu"))
+            stats = stats.to(device)
+            torch.distributed.all_reduce(stats, op=torch.distributed.ReduceOp.SUM)
+            stats = stats.cpu()
+
+        self._batch_labeled_tokens += int(stats[0].item())
+        self._batch_seq_len_sum += int(stats[1].item())
+        self._batch_trajectory_turns_sum += int(stats[2].item())
+        self._batch_samples += int(stats[3].item())
+
     def training_step(self, model, inputs, num_items_in_batch=None):
         if isinstance(inputs, dict):
             self._accumulate_patch_stats(inputs)
+            self._accumulate_batch_stats(inputs)
         return super().training_step(model, inputs, num_items_in_batch)
 
     def log(self, logs, start_time=None):
+        logs = {} if logs is None else dict(logs)
         if getattr(self, "_patch_samples", 0) > 0 and getattr(self, "_patch_baseline_tokens", 0) > 0:
-            logs = {} if logs is None else dict(logs)
             # Compute running means (average per sample)
             mean_baseline_tokens = self._patch_baseline_tokens / self._patch_samples if self._patch_samples > 0 else 0.0
             mean_final_tokens = self._patch_final_tokens / self._patch_samples if self._patch_samples > 0 else 0.0
@@ -851,6 +886,23 @@ class PatchStatsSFTTrainer:
             logs["patch_stats/mean_tokens_saved_per_sample"] = mean_tokens_saved
             logs["patch_stats/mean_reduction_pct"] = reduction_pct
             logs["patch_stats/samples"] = self._patch_samples
+        if getattr(self, "_batch_samples", 0) > 0:
+            logs["batch_stats/mean_labeled_tokens"] = self._batch_labeled_tokens / self._batch_samples
+            logs["batch_stats/mean_seq_len"] = self._batch_seq_len_sum / self._batch_samples
+            logs["batch_stats/mean_trajectory_turns"] = self._batch_trajectory_turns_sum / self._batch_samples
+            logs["batch_stats/samples"] = self._batch_samples
+            self._batch_labeled_tokens = 0
+            self._batch_seq_len_sum = 0
+            self._batch_trajectory_turns_sum = 0
+            self._batch_samples = 0
+        epoch = getattr(self.state, "epoch", None)
+        if epoch is not None:
+            logs["epoch_stats/current_epoch"] = float(epoch)
+            rounded_epoch = int(round(float(epoch)))
+            is_boundary = abs(float(epoch) - rounded_epoch) < 1e-6 and rounded_epoch > self._last_epoch_boundary
+            logs["epoch_stats/is_epoch_boundary"] = 1 if is_boundary else 0
+            if is_boundary:
+                self._last_epoch_boundary = rounded_epoch
         return super().log(logs, start_time)
 
 
@@ -1157,11 +1209,17 @@ class FaraDataset(torch.utils.data.Dataset):
             ids, self._header_ids, self._end_ids,
             last_only=(self.sampling_strategy in {"decision_point", "full_trajectory"}),
         )
+        num_labeled_tokens = sum(1 for label in labels if label != -100)
+        trajectory_turns = (len(messages) - 1) // 2
 
         out: Dict[str, torch.Tensor] = {
             "input_ids":      enc["input_ids"][0],
             "attention_mask": enc["attention_mask"][0],
             "labels":         torch.tensor(labels, dtype=torch.long),
+            "batch_labeled_tokens": torch.tensor(num_labeled_tokens, dtype=torch.long),
+            "batch_seq_len_sum": torch.tensor(len(ids), dtype=torch.long),
+            "batch_trajectory_turns_sum": torch.tensor(trajectory_turns, dtype=torch.long),
+            "batch_sample_count": torch.tensor(1, dtype=torch.long),
         }
         if "pixel_values" in enc:
             out["pixel_values"]   = enc["pixel_values"]
@@ -1250,6 +1308,24 @@ class FaraCollator:
             )
             out["patch_sample_count"] = torch.tensor(
                 sum(int(ex["patch_sample_count"].item()) for ex in batch if "patch_sample_count" in ex),
+                dtype=torch.long,
+            )
+
+        if any("batch_labeled_tokens" in ex for ex in batch):
+            out["batch_labeled_tokens"] = torch.tensor(
+                sum(int(ex["batch_labeled_tokens"].item()) for ex in batch if "batch_labeled_tokens" in ex),
+                dtype=torch.long,
+            )
+            out["batch_seq_len_sum"] = torch.tensor(
+                sum(int(ex["batch_seq_len_sum"].item()) for ex in batch if "batch_seq_len_sum" in ex),
+                dtype=torch.long,
+            )
+            out["batch_trajectory_turns_sum"] = torch.tensor(
+                sum(int(ex["batch_trajectory_turns_sum"].item()) for ex in batch if "batch_trajectory_turns_sum" in ex),
+                dtype=torch.long,
+            )
+            out["batch_sample_count"] = torch.tensor(
+                sum(int(ex["batch_sample_count"].item()) for ex in batch if "batch_sample_count" in ex),
                 dtype=torch.long,
             )
 
@@ -1681,6 +1757,7 @@ def main() -> None:
         remove_unused_columns=False,
         dataset_kwargs={"skip_prepare_dataset": True},
         max_length=args.max_seq_length,
+        average_tokens_across_devices=True,
         report_to=report_to,
         run_name=run_name,
         save_total_limit=args.save_total_limit if args.save_total_limit else None,
