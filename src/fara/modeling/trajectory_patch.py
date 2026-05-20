@@ -480,7 +480,7 @@ def visualize_trajectory(df_row, row_idx, output_dir, var_thresh, mse_thresh):
     images = df_row['images']
     items = images.tolist() if isinstance(images, np.ndarray) else list(images)
     n_original = len(items)
-    results, n_skipped, trailing_dup = process_trajectory(items, var_thresh, mse_thresh)
+    results = process_trajectory(items, var_thresh, mse_thresh)
 
     traj_dir = os.path.join(output_dir, f"traj_{row_idx:04d}")
     for r in results:
@@ -488,7 +488,7 @@ def visualize_trajectory(df_row, row_idx, output_dir, var_thresh, mse_thresh):
         visualize_frame(r['img'], r['kept_patches'], r['dropped_patches'],
                         r['frame_idx'], r['scroll_dy'], out_path)
 
-    stats = trajectory_stats(results, n_skipped, trailing_dup, n_original)
+    stats = trajectory_stats(results, 0, False, n_original)
     print_trajectory_stats(stats, traj_idx=row_idx)
     return stats
 
@@ -546,9 +546,9 @@ def main():
             images = row['images']
             items = images.tolist() if isinstance(images, np.ndarray) else list(images)
             n_original = len(items)
-            results, n_skipped, trailing_dup = process_trajectory(
+            results = process_trajectory(
                 items, args.var_thresh, args.mse_thresh)
-            s = trajectory_stats(results, n_skipped, trailing_dup, n_original)
+            s = trajectory_stats(results, 0, False, n_original)
             if not s:
                 continue
             s['traj_idx'] = i
