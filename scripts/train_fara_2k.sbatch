@@ -27,7 +27,8 @@ EVAL_STEPS=200                             # how often to run eval (default 500)
 INF_EVAL_SAMPLES=4                         # generations logged to wandb each eval (0/unset = off)
 INF_EVAL_MAX_NEW_TOKENS=256                # max new tokens per inference-eval sample
 INF_EVAL_SEED=0                            # seed for inference-eval sample selection
-SAMPLING_STRATEGY=full_trajectory          # or decision_point
+SAMPLING_STRATEGY=none                     # full retained trajectories; or decision_point/full_trajectory
+MAX_TRAJECTORY_TURNS=16                    # keep only rows with <= this many trajectory steps
 WANDB_RUN_NAME=fara-sft-2k-lora-singlescale
 WANDB_TAGS=lora,singlescale,2k
 EXTRA_ARGS="--no_multiscale"               # appended to train_fara.py CLI
@@ -130,7 +131,8 @@ else
 fi
 _TAGS+=("ep${EPOCHS:-1}")
 _TAGS+=("lr${LEARNING_RATE:-1e-5}")
-_TAGS+=("${SAMPLING_STRATEGY:-full_trajectory}")
+_TAGS+=("${SAMPLING_STRATEGY:-none}")
+_TAGS+=("max${MAX_TRAJECTORY_TURNS:-16}turns")
 [[ -n "${VAL_SPLIT_RATIO:-}" ]] && _TAGS+=("val${VAL_SPLIT_RATIO}")
 
 WANDB_TAGS_AUTO=$(IFS=,; echo "${_TAGS[*]}")
@@ -141,6 +143,10 @@ export TOKENIZERS_PARALLELISM=false
 export HF_DATASETS_CACHE=/gpfs/scrubbed/reza/hf_cache
 export HF_HOME=/gpfs/scrubbed/reza/hf_cache
 export HF_HUB_CACHE=/gpfs/scrubbed/reza/hf_cache/hub
+
+# Pin a wandb run id so the post-hoc inference-eval step can resume the
+# same run and log per-checkpoint HTMLs on the original training timeline.
+export WANDB_RUN_ID="${WANDB_RUN_ID:-${SLURM_JOB_ID:-local}}"
 
 # Directory for debug dumps when multiscale kept_patches is empty; default per-run
 export FARA_EMPTY_KEPT_DUMP_DIR="${FARA_EMPTY_KEPT_DUMP_DIR:-$RESULTS_ROOT/fara_empty_kept_${SLURM_JOB_ID:-local}}"
@@ -166,14 +172,15 @@ accelerate launch \
     --logging_steps 1 \
     --save_steps 128 \
     --save_total_limit ${SAVE_TOTAL_LIMIT:-3} \
+    --max_trajectory_turns ${MAX_TRAJECTORY_TURNS:-8} \
     ${MAX_SAMPLES_FLAG} \
     ${VAL_FLAGS} \
     ${INF_EVAL_FLAGS} \
     ${VISION_LR_FLAGS} \
-    --sampling_strategy ${SAMPLING_STRATEGY:-full_trajectory} \
+    --sampling_strategy ${SAMPLING_STRATEGY:-none} \
     --bf16 \
     --gradient_checkpointing \
-    --attn_implementation sdpa \
+    --attn_implementation flash_attention_2 \
     --allowed_domains "${ALLOWED_DOMAINS:-google.com,wolframalpha.com,booking.com,dictionary.cambridge.org,arxiv.org,github.com,allrecipes.com,coursera.org,amazon.com,espn.com,huggingface.co,apple.com,bbc.com}" \
     ${LORA_FLAG} \
     --report_to wandb \
@@ -183,5 +190,43 @@ accelerate launch \
     --wandb_run_name "$WANDB_RUN_NAME" \
     --wandb_tags "$WANDB_TAGS" \
     ${EXTRA_ARGS:-}
+
+echo "[$(date)] training finished"
+
+# ----- Post-training: single-GPU inference eval over saved checkpoints. -----
+# Loads each checkpoint-* on cuda:0 (no FSDP), runs InferenceEvalCallback's
+# rendering pass on the same val split, and logs HTMLs to the same wandb run
+# (resumed via WANDB_RUN_ID) plotted against eval/inf/ckpt_step.
+if [[ -n "${VAL_SPLIT_RATIO:-}" && -n "${INF_EVAL_SAMPLES:-}" && "${INF_EVAL_SAMPLES}" != "0" ]]; then
+  echo "[$(date)] starting post-hoc inference eval on cuda:0"
+
+  POSTHOC_MULTISCALE_FLAG=""
+  if [[ "${EXTRA_ARGS:-}" == *"--no_multiscale"* ]]; then
+    POSTHOC_MULTISCALE_FLAG="--no_multiscale"
+  fi
+
+  CUDA_VISIBLE_DEVICES=0 python /gpfs/projects/raivn/reza/fara/scripts/inference_eval_checkpoints.py \
+      --ckpt_dir "$OUTPUT_DIR" \
+      --base_model_id "$MODEL_ID" \
+      --gpu_id 0 \
+      --data_path "$DATA_PATH" \
+      --allowed_domains "${ALLOWED_DOMAINS:-google.com,wolframalpha.com,booking.com,dictionary.cambridge.org,arxiv.org,github.com,allrecipes.com,coursera.org,amazon.com,espn.com,huggingface.co,apple.com,bbc.com}" \
+      --domain_filter_mode "${DOMAIN_FILTER_MODE:-strict}" \
+      --sampling_strategy "${SAMPLING_STRATEGY:-none}" \
+      --max_seq_length "${MAX_SEQ_LENGTH:-16384}" \
+      --max_trajectory_turns "${MAX_TRAJECTORY_TURNS:-8}" \
+      ${MAX_SAMPLES_FLAG} \
+      --val_split_ratio "${VAL_SPLIT_RATIO}" \
+      --val_split_seed 42 \
+      ${VAL_MAX_SAMPLES:+--val_max_samples "${VAL_MAX_SAMPLES}"} \
+      ${POSTHOC_MULTISCALE_FLAG} \
+      --bf16 --attn_implementation flash_attention_2 \
+      --inf_eval_samples "${INF_EVAL_SAMPLES}" \
+      --inf_eval_seed "${INF_EVAL_SEED:-0}" \
+      --inf_eval_max_new_tokens "${INF_EVAL_MAX_NEW_TOKENS:-256}" \
+      --wandb_entity mrsalehi \
+      --wandb_project fara-multiscale \
+      --wandb_run_id "$WANDB_RUN_ID"
+fi
 
 echo "[$(date)] done"

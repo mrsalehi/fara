@@ -73,7 +73,10 @@ MAX_URL_LENGTH = 100         # mirrors FaraAgent.MAX_URL_LENGTH
 
 def _filter_cache_key(args: Any) -> str:
     domains = sorted(d.strip().lower() for d in args.allowed_domains.split(",") if d.strip())
-    key_str = f"{args.data_path}|{','.join(domains)}|{args.domain_filter_mode}"
+    key_str = (
+        f"{args.data_path}|{','.join(domains)}|{args.domain_filter_mode}|"
+        f"max_trajectory_turns={args.max_trajectory_turns}"
+    )
     return hashlib.md5(key_str.encode()).hexdigest()[:12]
 
 
@@ -467,6 +470,31 @@ def _parse_trajectory(raw_trajectory: Any) -> List[Any]:
         return list(traj.values())
 
     return []
+
+
+def _trajectory_turn_count(row: Dict[str, Any]) -> int:
+    return len(_parse_trajectory(row.get("trajectory", [])))
+
+
+def _resolve_parquet_files(data_path: str) -> List[str]:
+    files: List[str] = []
+    for raw_part in data_path.split(","):
+        part = raw_part.strip()
+        if not part:
+            continue
+        if os.path.isdir(part):
+            files.extend(
+                os.path.join(part, name)
+                for name in sorted(os.listdir(part))
+                if name.endswith(".parquet")
+            )
+        elif os.path.isfile(part):
+            files.append(part)
+        else:
+            raise FileNotFoundError(f"data path does not exist: {part}")
+    if not files:
+        raise FileNotFoundError(f"no parquet files found from --data_path={data_path}")
+    return files
 
 
 def _normalize_url(u: Any) -> Optional[str]:
@@ -960,8 +988,7 @@ class InferenceEvalCallback(TrainerCallback):
             import wandb
         except ImportError:
             return
-        # Under FSDP FULL_SHARD, every rank must participate in model.generate()
-        # so the per-layer all-gathers can complete; only rank 0 logs to wandb.
+        # Intended for single-GPU post-training use (FSDP path was removed).
         is_main = is_main_process() and wandb.run is not None
         device = next(model.parameters()).device
         was_training = model.training
@@ -1043,10 +1070,13 @@ class InferenceEvalCallback(TrainerCallback):
                 + separator.join(task_sections) +
                 f'</body></html>'
             )
-            wandb.log(
-                {"eval/inf/samples": wandb.Html(page)},
-                step=wandb.run.step,
-            )
+            # Plot against a custom x-axis (eval/inf/ckpt_step) declared via
+            # wandb.define_metric in the post-hoc driver, so resuming a run
+            # past these steps doesn't trip the monotonic-step check.
+            wandb.log({
+                "eval/inf/samples": wandb.Html(page),
+                "eval/inf/ckpt_step": state.global_step,
+            })
 
         torch.distributed.barrier() if torch.distributed.is_available() and torch.distributed.is_initialized() else None
 
@@ -1061,7 +1091,7 @@ class FaraDataset(torch.utils.data.Dataset):
         hf_dataset: Any,
         processor: Any,
         use_multiscale: bool = True,
-        sampling_strategy: str = "decision_point",
+        sampling_strategy: str = "none",
         max_n_images: int = 3,
         max_seq_length: int = 8192,
     ) -> None:
@@ -1106,8 +1136,11 @@ class FaraDataset(torch.utils.data.Dataset):
             messages=messages,
             images=pil_images,
             padding=False,
-            truncation=True,
-            max_length=self.max_seq_length,
+            # Do not tokenizer-truncate multimodal prompts: truncation can
+            # remove some expanded <image> tokens while leaving the processor's
+            # text-side image count unchanged, which trips the Qwen/FARA
+            # special-token consistency check.
+            truncation=False,
             return_tensors="pt",
         )
 
@@ -1228,7 +1261,8 @@ def parse_args() -> argparse.Namespace:
 
     # Data / model / output
     p.add_argument("--data_path", required=True,
-                   help="Parquet file or directory of parquet files.")
+                   help="Parquet file, directory of parquet files, or a "
+                        "comma-separated list of files/directories.")
     p.add_argument("--model_id", default="microsoft/Fara-7B")
     p.add_argument("--output_dir", required=True)
 
@@ -1254,6 +1288,10 @@ def parse_args() -> argparse.Namespace:
                         "Older ones are deleted. Set to None/0 to keep all.")
     p.add_argument("--max_samples", type=int, default=None,
                    help="Cap dataset size (useful for smoke tests).")
+    p.add_argument("--max_trajectory_turns", type=int, default=None,
+                   help="Keep only raw trajectories with at most this many "
+                        "turns/steps before message conversion. This is a "
+                        "dataset-level row filter, not prompt truncation.")
     p.add_argument("--shuffle_seed", type=int, default=42,
                    help="Seed for shuffling the dataset before max_samples / "
                         "train-val split. Set to a negative value to disable.")
@@ -1324,7 +1362,7 @@ def parse_args() -> argparse.Namespace:
                    help="Disable multi-scale patching (single-scale path).")
     p.add_argument("--lora", action="store_true",
                    help="LoRA fine-tune instead of full fine-tune.")
-    p.add_argument("--sampling_strategy", default="decision_point",
+    p.add_argument("--sampling_strategy", default="none",
                     choices=["none", "decision_point", "full_trajectory"],
                    help="How to sample within each trajectory at training time. "
                         "'none' = train on the whole trajectory as-is. "
@@ -1411,34 +1449,52 @@ def build_dataset(args: argparse.Namespace, processor: Qwen2_5_VLProcessor):
         )
 
     def _load_and_filter() -> Any:
-        if os.path.isdir(args.data_path):
-            ds_local = load_dataset("parquet", data_dir=args.data_path, split="train", num_proc=4)
-        else:
-            ds_local = load_dataset("parquet", data_files=args.data_path, split="train", num_proc=4)
+        data_files = _resolve_parquet_files(args.data_path)
+        log(f"[fara-train] loading {len(data_files)} parquet file(s)")
+        ds_local = load_dataset(
+            "parquet", data_files=data_files, split="train", num_proc=4
+        )
 
         allowed_domains = [d.strip().lower() for d in args.allowed_domains.split(",") if d.strip()]
         allowed_domains = [d[4:] if d.startswith("www.") else d for d in allowed_domains]
-        if not allowed_domains:
-            return ds_local
+        if allowed_domains:
+            log(f"[fara-train] applying domain allowlist ({args.domain_filter_mode}): {allowed_domains}")
 
-        log(f"[fara-train] applying domain allowlist ({args.domain_filter_mode}): {allowed_domains}")
+            def _keep_row(row: Dict[str, Any]) -> bool:
+                domains = _extract_row_domains(row.get("trajectory"))
+                if not domains:
+                    return False
+                if args.domain_filter_mode == "strict":
+                    return all(_domain_allowed(d, allowed_domains) for d in domains)
+                return any(_domain_allowed(d, allowed_domains) for d in domains)
 
-        def _keep_row(row: Dict[str, Any]) -> bool:
-            domains = _extract_row_domains(row.get("trajectory"))
-            if not domains:
-                return False
-            if args.domain_filter_mode == "strict":
-                return all(_domain_allowed(d, allowed_domains) for d in domains)
-            return any(_domain_allowed(d, allowed_domains) for d in domains)
+            before = len(ds_local)
+            ds_local = ds_local.filter(_keep_row, num_proc=4)
+            after = len(ds_local)
+            log(f"[fara-train] domain filter kept {after}/{before} rows")
+            if after == 0:
+                raise ValueError(
+                    "Domain filter removed all rows. Verify --allowed_domains and trajectory URL extraction."
+                )
 
-        before = len(ds_local)
-        ds_local = ds_local.filter(_keep_row, num_proc=4)
-        after = len(ds_local)
-        log(f"[fara-train] domain filter kept {after}/{before} rows")
-        if after == 0:
-            raise ValueError(
-                "Domain filter removed all rows. Verify --allowed_domains and trajectory URL extraction."
+        if args.max_trajectory_turns is not None:
+            if args.max_trajectory_turns <= 0:
+                raise ValueError(f"--max_trajectory_turns must be positive; got {args.max_trajectory_turns}")
+
+            before = len(ds_local)
+            max_turns = args.max_trajectory_turns
+            ds_local = ds_local.filter(
+                lambda row: _trajectory_turn_count(row) <= max_turns,
+                num_proc=4,
             )
+            after = len(ds_local)
+            log(f"[fara-train] trajectory-length filter kept {after}/{before} "
+                f"rows with <= {max_turns} turns")
+            if after == 0:
+                raise ValueError(
+                    f"Trajectory-length filter removed all rows. "
+                    f"Increase --max_trajectory_turns above {max_turns}."
+                )
         return ds_local
 
     # Multi-rank coordination: main builds + saves, others wait + load_from_disk.
@@ -1655,23 +1711,10 @@ def main() -> None:
     )
     trainer._init_patch_stats()
 
-    if (
-        eval_hf_dataset is not None
-        and "wandb" in report_to
-        and args.inf_eval_samples > 0
-    ):
-        trainer.add_callback(
-            InferenceEvalCallback(
-                eval_hf_dataset=eval_hf_dataset,
-                processor=processor,
-                n_samples=args.inf_eval_samples,
-                max_n_images=args.max_n_images_train,
-                max_new_tokens=args.inf_eval_max_new_tokens,
-                seed=args.inf_eval_seed,
-            )
-        )
-        log(f"[fara-train] inference eval callback: {args.inf_eval_samples} "
-            f"samples per eval (seed={args.inf_eval_seed})")
+    # In-training inference eval is disabled: it doesn't play well with FSDP
+    # (callback receives the unwrapped model). Run inference eval post-hoc via
+    # scripts/inference_eval_checkpoints.py — that script imports
+    # InferenceEvalCallback and calls it per saved checkpoint on a single GPU.
 
     trainer.train()
 
