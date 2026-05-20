@@ -18,8 +18,11 @@ Usage:
 """
 import argparse
 import base64
+import bisect
+from collections import defaultdict
 import io
 import json
+import random
 import re
 import sys
 from html import escape
@@ -27,6 +30,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 import numpy as np
+import pyarrow.parquet as pq
 from datasets import load_dataset
 from PIL import Image
 
@@ -42,6 +46,12 @@ from train_fara import (  # noqa: E402
 
 
 USER_MESSAGE = "Here is the next screenshot. Think about what to do next."
+
+
+def _as_list(value: Any) -> List[Any]:
+    if value is None:
+        return []
+    return list(value)
 
 
 def _to_pil(img_entry: Any) -> Image.Image:
@@ -73,7 +83,7 @@ def _extract_instruction(raw: Any) -> str:
         except json.JSONDecodeError:
             return raw.strip()
     if isinstance(raw, dict):
-        for key in ("high_level", "instruction", "task", "goal"):
+        for key in ("high_level", "instruction", "low_level", "task", "goal"):
             v = raw.get(key)
             if isinstance(v, str) and v.strip():
                 return v.strip()
@@ -173,7 +183,7 @@ def _render_row_section(row: Dict[str, Any], row_idx: int,
     (html_section, sample_id_str, instruction_short)."""
     sample_id = str(row.get("sample_id", f"row_{row_idx}"))
     instruction = _extract_instruction(row.get("instruction", ""))
-    images = list(row.get("images") or [])
+    images = _as_list(row.get("images"))
     steps = _parse_trajectory(row.get("trajectory") or [])
     n = min(len(images), len(steps))
 
@@ -247,7 +257,7 @@ def _render_messages_row_section(row: Dict[str, Any], row_idx: int,
     a sanity-check HTML of the actual rows the trainer will consume.
     """
     messages = list(row.get("messages") or [])
-    images = list(row.get("images") or [])
+    images = _as_list(row.get("images"))
     sample_id = str(row.get("sample_id", f"row_{row_idx}"))
 
     # Best-effort instruction recovery: it's the text of the first user message.
@@ -357,6 +367,98 @@ def _safe_filename(name: str) -> str:
     return re.sub(r"[^a-zA-Z0-9._-]", "_", str(name))[:120]
 
 
+def _row_allowed(row: Dict[str, Any], allowed: List[str], mode: str) -> bool:
+    if not allowed:
+        return True
+    domains = _extract_row_domains(row.get("trajectory"))
+    if not domains:
+        return False
+    if mode == "strict":
+        return all(_domain_allowed(d, allowed) for d in domains)
+    return any(_domain_allowed(d, allowed) for d in domains)
+
+
+def _normalize_allowed_domains(raw: str) -> List[str]:
+    if not raw:
+        return []
+    allowed = [d.strip().lower() for d in raw.split(",") if d.strip()]
+    return [d[4:] if d.startswith("www.") else d for d in allowed]
+
+
+def _file_row_count(path: Path) -> int:
+    return pq.ParquetFile(path).metadata.num_rows
+
+
+def _sample_parquet_rows(
+    files: List[Path],
+    max_rows: int,
+    seed: int,
+    allowed: List[str],
+    domain_filter_mode: str,
+    oversample_factor: int,
+) -> List[Dict[str, Any]]:
+    """Randomly sample row positions and load only those rows from parquet.
+
+    This is intended for visualization, not exact train/eval sampling. Without
+    a domain filter, sampled rows are uniform over all rows. With a domain
+    filter, we oversample first and keep matching rows until max_rows.
+    """
+    rng = random.Random(seed)
+    row_counts = [_file_row_count(f) for f in files]
+    total_rows = sum(row_counts)
+    if total_rows == 0:
+        return []
+
+    target = max_rows if max_rows is not None else total_rows
+    sample_size = target
+    if allowed:
+        sample_size = min(total_rows, max(target * max(oversample_factor, 1), target))
+    else:
+        sample_size = min(total_rows, target)
+
+    global_indices = rng.sample(range(total_rows), sample_size)
+    cumulative = [0]
+    for n in row_counts:
+        cumulative.append(cumulative[-1] + n)
+
+    by_file: Dict[int, List[Tuple[int, int]]] = defaultdict(list)
+    for order, global_idx in enumerate(global_indices):
+        file_idx = bisect.bisect_right(cumulative, global_idx) - 1
+        local_idx = global_idx - cumulative[file_idx]
+        by_file[file_idx].append((order, local_idx))
+
+    sampled: List[Tuple[int, Dict[str, Any]]] = []
+    for file_idx, order_and_rows in by_file.items():
+        fp = files[file_idx]
+        pf = pq.ParquetFile(fp)
+        rg_starts = [0]
+        for rg_idx in range(pf.num_row_groups):
+            rg_starts.append(rg_starts[-1] + pf.metadata.row_group(rg_idx).num_rows)
+
+        by_rg: Dict[int, List[Tuple[int, int]]] = defaultdict(list)
+        for order, local_idx in order_and_rows:
+            rg_idx = bisect.bisect_right(rg_starts, local_idx) - 1
+            offset = local_idx - rg_starts[rg_idx]
+            by_rg[rg_idx].append((order, offset))
+
+        for rg_idx, order_and_offsets in by_rg.items():
+            table = pf.read_row_group(rg_idx)
+            rows = table.to_pylist()
+            for order, offset in order_and_offsets:
+                row = dict(rows[offset])
+                row.setdefault("sample_id", f"{fp.name}:{rg_starts[rg_idx] + offset}")
+                row["_source_file"] = fp.name
+                row["_source_row"] = rg_starts[rg_idx] + offset
+                if _row_allowed(row, allowed, domain_filter_mode):
+                    sampled.append((order, row))
+
+    sampled.sort(key=lambda x: x[0])
+    rows = [row for _, row in sampled]
+    if max_rows is not None:
+        rows = rows[:max_rows]
+    return rows
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--data_path", required=True,
@@ -367,6 +469,14 @@ def main():
                    help="Seed for shuffling before slicing. Set to a negative "
                         "number to skip the shuffle (parquet file order). "
                         "Default 0 keeps the sample reproducible.")
+    p.add_argument("--sample_mode", choices=("hf", "parquet_random"), default="hf",
+                   help="'hf' uses datasets.load_dataset then shuffles/selects. "
+                        "'parquet_random' samples row positions directly from "
+                        "parquet files and loads only those rows.")
+    p.add_argument("--parquet_random_oversample_factor", type=int, default=10,
+                   help="When --sample_mode parquet_random and domain filtering "
+                        "is enabled, sample max_rows*N candidate rows before "
+                        "filtering.")
     p.add_argument("--max_image_dim", type=int, default=1280,
                    help="Resize each screenshot so its longest side is at "
                         "most this many pixels. 0 = keep original.")
@@ -393,23 +503,31 @@ def main():
     if not files:
         raise SystemExit(f"no parquet files under {in_path}")
 
-    ds = load_dataset(
-        "parquet", data_files=[str(f) for f in files], split="train",
-    )
+    allowed = _normalize_allowed_domains(args.allowed_domains)
+    if args.sample_mode == "parquet_random":
+        if args.shuffle_seed is None or args.shuffle_seed < 0:
+            raise SystemExit("--sample_mode parquet_random requires a non-negative --shuffle_seed")
+        ds = _sample_parquet_rows(
+            files=files,
+            max_rows=args.max_rows,
+            seed=args.shuffle_seed,
+            allowed=allowed,
+            domain_filter_mode=args.domain_filter_mode,
+            oversample_factor=args.parquet_random_oversample_factor,
+        )
+        print(f"parquet_random sample: {len(ds)} row(s) selected")
+        if len(ds) == 0:
+            raise SystemExit("random sampling produced no rows.")
+    else:
+        ds = load_dataset(
+            "parquet", data_files=[str(f) for f in files], split="train",
+        )
 
-    # Domain allowlist — same logic as train_fara's _keep_row, kept verbatim
-    # so the viz mirrors what training would actually consume.
-    if args.allowed_domains:
-        allowed = [d.strip().lower() for d in args.allowed_domains.split(",") if d.strip()]
-        allowed = [d[4:] if d.startswith("www.") else d for d in allowed]
+        # Domain allowlist — same logic as train_fara's _keep_row, kept verbatim
+        # so the viz mirrors what training would actually consume.
         if allowed:
             def _keep(row):
-                domains = _extract_row_domains(row.get("trajectory"))
-                if not domains:
-                    return False
-                if args.domain_filter_mode == "strict":
-                    return all(_domain_allowed(d, allowed) for d in domains)
-                return any(_domain_allowed(d, allowed) for d in domains)
+                return _row_allowed(row, allowed, args.domain_filter_mode)
             before = len(ds)
             ds = ds.filter(_keep, num_proc=4)
             print(f"domain filter ({args.domain_filter_mode}, {allowed}): "
@@ -417,10 +535,10 @@ def main():
             if len(ds) == 0:
                 raise SystemExit("domain filter removed all rows.")
 
-    if args.shuffle_seed is not None and args.shuffle_seed >= 0:
-        ds = ds.shuffle(seed=args.shuffle_seed)
-    if args.max_rows is not None:
-        ds = ds.select(range(min(args.max_rows, len(ds))))
+        if args.shuffle_seed is not None and args.shuffle_seed >= 0:
+            ds = ds.shuffle(seed=args.shuffle_seed)
+        if args.max_rows is not None:
+            ds = ds.select(range(min(args.max_rows, len(ds))))
 
     # Render each trajectory as a <details> block, then assemble one HTML
     # document: TOC at the top, all sections below. Single file = single URL

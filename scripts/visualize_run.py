@@ -98,8 +98,9 @@ def _load_events(task_dir: Path) -> List[Dict[str, Any]]:
     return [
         e for e in out
         if e.get("action") is not None and (
-            e.get("source") in (None, "WebSurfer", "fara")
+            e.get("source") in (None, "WebSurfer", "fara", "FaraAgent")
             or "WebSurfer" in str(e.get("source", ""))
+            or "Fara" in str(e.get("source", ""))
         )
     ]
 
