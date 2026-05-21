@@ -134,7 +134,7 @@ _TAGS+=("ep${EPOCHS:-1}")
 _TAGS+=("lr${LEARNING_RATE:-1e-5}")
 _TAGS+=("${OPTIMIZER:-adamw_torch}")
 _TAGS+=("${SAMPLING_STRATEGY:-none}")
-_TAGS+=("max${MAX_TRAJECTORY_TURNS:-16}turns")
+_TAGS+=("max${MAX_TRAJECTORY_TURNS:-8}turns")
 [[ -n "${VAL_SPLIT_RATIO:-}" ]] && _TAGS+=("val${VAL_SPLIT_RATIO}")
 
 WANDB_TAGS_AUTO=$(IFS=,; echo "${_TAGS[*]}")
